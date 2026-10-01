@@ -14,6 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     env:
       RUSTUP_AUTO_INSTALL: "0"
     steps:
@@ -32,7 +35,6 @@ jobs:
         run: Save-Module -Name Pester -RequiredVersion 5.7.1 -Repository PSGallery -Path "$env:RUNNER_TEMP/windows-setup-tests" -Force
 
       - name: Test Windows setup with mocked installers
-        shell: ${{ matrix.shell }}
         run: |
           Import-Module "$env:RUNNER_TEMP/windows-setup-tests/Pester/5.7.1/Pester.psd1" -Force
           $result = Invoke-Pester -Path ./codex-rs/scripts/setup-windows.Tests.ps1 -CI -PassThru
