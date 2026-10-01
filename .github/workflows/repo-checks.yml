@@ -4,6 +4,44 @@ on:
   workflow_call:
 
 jobs:
+  windows-setup:
+    name: Windows setup (${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    env:
+      RUSTUP_AUTO_INSTALL: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Download Pester for this runner
+        shell: pwsh
+        run: Save-Module -Name Pester -RequiredVersion 5.7.1 -Repository PSGallery -Path "$env:RUNNER_TEMP/windows-setup-tests" -Force
+
+      - name: Test Windows setup with mocked installers
+        shell: ${{ matrix.shell }}
+        run: |
+          Import-Module "$env:RUNNER_TEMP/windows-setup-tests/Pester/5.7.1/Pester.psd1" -Force
+          $result = Invoke-Pester -Path ./codex-rs/scripts/setup-windows.Tests.ps1 -CI -PassThru
+          if ($result.PassedCount -eq 0) { throw 'No Windows setup tests ran.' }
+
+      - name: Check for a clean worktree
+        if: always() && !cancelled()
+        uses: ./.github/actions/check-clean-worktree
+
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
