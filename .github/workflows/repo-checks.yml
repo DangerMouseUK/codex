@@ -37,8 +37,8 @@ jobs:
       - name: Test Windows setup with mocked installers
         run: |
           Import-Module "$env:RUNNER_TEMP/windows-setup-tests/Pester/5.7.1/Pester.psd1" -Force
-          $result = Invoke-Pester -Path ./codex-rs/scripts/setup-windows.Tests.ps1 -CI -PassThru
-          if ($result.PassedCount -eq 0) { throw 'No Windows setup tests ran.' }
+          $result = Invoke-Pester -Path ./codex-rs/scripts/setup-windows.Tests.ps1 -PassThru -Output Normal
+          if ($result.FailedCount -ne 0 -or $result.PassedCount -eq 0) { throw 'Windows setup tests failed or did not run.' }
 
       - name: Check for a clean worktree
         if: always() && !cancelled()
