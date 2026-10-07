@@ -1,246 +1,490 @@
+#Requires -Version 5.1
 <#
-  Setup script for building codex-rs on Windows.
+.SYNOPSIS
+    Install and verify the Windows development tools used by the Codex repository.
+.DESCRIPTION
+    Supports Windows PowerShell 5.1 and PowerShell 7 on x64 and ARM64 Windows.
+    Run as your normal Windows user; machine-wide installers may request UAC
+    elevation. Rust and pnpm versions come from the repository configuration.
 
-  What it does:
-  - Installs Rust toolchain (via winget rustup) and required components
-  - Installs Visual Studio 2022 Build Tools (MSVC + Windows SDK)
-  - Installs helpful CLIs used by the repo: git, ripgrep (rg), just, cmake
-  - Installs cargo-insta (for snapshot tests) via cargo
-  - Ensures PATH contains Cargo bin for the current session
-  - Builds the workspace (cargo build)
-
-  Usage:
-    - Right-click PowerShell and "Run as Administrator" (VS Build Tools require elevation)
-    - From the repo root (codex-rs), run:
-        powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1
-
-  Notes:
-    - Requires winget (Windows Package Manager). Most modern Windows 10/11 have it preinstalled.
-    - The script is re-runnable; winget/cargo will skip/reinstall as appropriate.
+    Installs prerequisites and Cargo helper tools, but does not build Codex,
+    run tests, or install workspace JavaScript/Python dependencies. Existing
+    tools are reused when their versions satisfy the repository's requirements.
+    Compiler settings are applied only to the current PowerShell process.
+.PARAMETER CheckOnly
+    Verify existing tools and activate the MSVC environment in this session.
+    Does not install packages or write persistent environment/Git settings.
+.EXAMPLE
+    & .\codex-rs\scripts\setup-windows.ps1
+.EXAMPLE
+    & .\codex-rs\scripts\setup-windows.ps1 -CheckOnly
+.NOTES
+    Requires WinGet 1.6 or newer for installation. Reopen PowerShell after setup
+    when invoking this script through powershell.exe -File or pwsh -File.
 #>
-
+[CmdletBinding()]
 param(
-  [switch] $SkipBuild
+    [switch]$CheckOnly
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Check exit codes ourselves, including on PowerShell 7 with this option enabled.
+$PSNativeCommandUseErrorActionPreference = $false
 
-function Ensure-Command($Name) {
-  $exists = Get-Command $Name -ErrorAction SilentlyContinue
-  return $null -ne $exists
-}
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [int[]]$SuccessExitCodes = @(0)
+    )
 
-function Add-CargoBinToPath() {
-  $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-  if (Test-Path $cargoBin) {
-    if (-not ($env:Path.Split(';') -contains $cargoBin)) {
-      $env:Path = "$env:Path;$cargoBin"
+    & $FilePath @ArgumentList
+    $code = $LASTEXITCODE
+    if ($code -eq 3010 -or $code -eq -1978334967) {
+        # WinGet INSTALL_REBOOT_REQUIRED_TO_FINISH (0x8A150109), or MSI 3010.
+        throw "$FilePath requires a restart to finish installation. Restart Windows and rerun setup."
     }
-  }
-}
-
-function Ensure-UserPathContains([string] $Segment) {
-  try {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($null -eq $userPath) { $userPath = '' }
-    $parts = $userPath.Split(';') | Where-Object { $_ -ne '' }
-    if (-not ($parts -contains $Segment)) {
-      $newPath = if ($userPath) { "$userPath;$Segment" } else { $Segment }
-      [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+    if ($SuccessExitCodes -notcontains $code) {
+        throw "$FilePath failed with exit code $code. Resolve the error above and rerun setup."
     }
-  } catch {}
 }
 
-function Ensure-UserEnvVar([string] $Name, [string] $Value) {
-  try { [Environment]::SetEnvironmentVariable($Name, $Value, 'User') } catch {}
-}
+function Get-ApplicationPath {
+    param([string]$Name)
 
-function Ensure-VSComponents([string[]]$Components) {
-  $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-  if (-not (Test-Path $vsInstaller) -or -not (Test-Path $vswhere)) { return }
-
-  $instPath = & $vswhere -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath 2>$null
-  if (-not $instPath) {
-    # 2022 instance may be present without VC Tools; pick BuildTools 2022 and add components
-    $instPath = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -version "[17.0,18.0)" -property installationPath 2>$null
-  }
-  if (-not $instPath) {
-    $instPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools -property installationPath 2>$null
-  }
-  if (-not $instPath) {
-    $default2022 = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools'
-    if (Test-Path $default2022) { $instPath = $default2022 }
-  }
-  if (-not $instPath) { return }
-
-  $vsDevCmd = Join-Path $instPath 'Common7\Tools\VsDevCmd.bat'
-  $verb = if (Test-Path $vsDevCmd) { 'modify' } else { 'install' }
-  $args = @($verb, '--installPath', $instPath, '--quiet', '--norestart', '--nocache')
-  if ($verb -eq 'install') { $args += @('--productId', 'Microsoft.VisualStudio.Product.BuildTools') }
-  foreach ($c in $Components) { $args += @('--add', $c) }
-  Write-Host "-- Ensuring VS components installed: $($Components -join ', ')" -ForegroundColor DarkCyan
-  & $vsInstaller @args | Out-Host
-}
-
-function Enter-VsDevShell() {
-  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-  if (-not (Test-Path $vswhere)) { return }
-
-  $instPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-  if (-not $instPath) {
-    # Try ARM64 components
-    $instPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath 2>$null
-  }
-  if (-not $instPath) { return }
-
-  $vsDevCmd = Join-Path $instPath 'Common7\Tools\VsDevCmd.bat'
-  if (-not (Test-Path $vsDevCmd)) { return }
-
-  # Prefer ARM64 on ARM machines, otherwise x64
-  $arch = if ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
-  $devCmdStr = ('"{0}" -no_logo -arch={1} -host_arch={1} & set' -f $vsDevCmd, $arch)
-  $envLines = & cmd.exe /c $devCmdStr
-  foreach ($line in $envLines) {
-    if ($line -match '^(.*?)=(.*)$') {
-      $name = $matches[1]
-      $value = $matches[2]
-      try { [Environment]::SetEnvironmentVariable($name, $value, 'Process') } catch {}
+    $commands = @(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue)
+    foreach ($command in $commands) {
+        # Do not launch the Microsoft Store's Python app execution alias.
+        if ($Name -eq 'python.exe' -and $command.Source -match '\\Microsoft\\WindowsApps\\') {
+            continue
+        }
+        return $command.Source
     }
-  }
+    return $null
 }
 
-Write-Host "==> Installing prerequisites via winget (may take a while)" -ForegroundColor Cyan
+function Update-SessionPath {
+    param([string[]]$Prepend = @())
 
-# Accept agreements up-front for non-interactive installs
-$WingetArgs = @('--accept-package-agreements', '--accept-source-agreements', '-e')
-
-if (-not (Ensure-Command 'winget')) {
-  throw "winget is required. Please update to the latest Windows 10/11 or install winget."
-}
-
-# 1) Visual Studio 2022 Build Tools (MSVC toolchain + Windows SDK)
-# The VC Tools workload brings the required MSVC toolchains; include recommended components to pick up a Windows SDK.
-Write-Host "-- Installing Visual Studio Build Tools (VC Tools workload + ARM64 toolchains)" -ForegroundColor DarkCyan
-$vsOverride = @(
-  '--quiet', '--wait', '--norestart', '--nocache',
-  '--add', 'Microsoft.VisualStudio.Workload.VCTools',
-  '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
-  '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64EC',
-  '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22000'
-) -join ' '
-winget install @WingetArgs --id Microsoft.VisualStudio.2022.BuildTools --override $vsOverride | Out-Host
-
-# Ensure required VC components even if winget doesn't modify the instance
-$isArm64 = ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64')
-$components = @(
-  'Microsoft.VisualStudio.Workload.VCTools',
-  'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
-  'Microsoft.VisualStudio.Component.VC.Tools.ARM64EC',
-  'Microsoft.VisualStudio.Component.Windows11SDK.22000'
-)
-Ensure-VSComponents -Components $components
-
-# 2) Rustup
-Write-Host "-- Installing rustup" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Rustlang.Rustup | Out-Host
-
-# Make cargo available in this session
-Add-CargoBinToPath
-
-# 3) Git (often present, but ensure installed)
-Write-Host "-- Installing Git" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Git.Git | Out-Host
-
-# 4) ripgrep (rg)
-Write-Host "-- Installing ripgrep (rg)" -ForegroundColor DarkCyan
-winget install @WingetArgs --id BurntSushi.ripgrep.MSVC | Out-Host
-
-# 5) just
-Write-Host "-- Installing just" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Casey.Just | Out-Host
-
-# 6) cmake (commonly needed by native crates)
-Write-Host "-- Installing CMake" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Kitware.CMake | Out-Host
-
-# Ensure cargo is available after rustup install
-Add-CargoBinToPath
-if (-not (Ensure-Command 'cargo')) {
-  # Some shells need a re-login; attempt to source cargo.env if present
-  $cargoEnv = Join-Path $env:USERPROFILE ".cargo\env"
-  if (Test-Path $cargoEnv) { . $cargoEnv }
-  Add-CargoBinToPath
-}
-if (-not (Ensure-Command 'cargo')) {
-  throw "cargo not found in PATH after rustup install. Please open a new terminal and re-run the script."
-}
-
-Write-Host "==> Configuring Rust toolchain per rust-toolchain.toml" -ForegroundColor Cyan
-
-# Pin to the workspace toolchain and install components
-$toolchain = '1.95.0'
-& rustup toolchain install $toolchain --profile minimal | Out-Host
-& rustup default $toolchain | Out-Host
-& rustup component add clippy rustfmt rust-src --toolchain $toolchain | Out-Host
-
-# 6.5) LLVM/Clang (some crates/bindgen require clang/libclang)
-function Add-LLVMToPath() {
-  $llvmBin = 'C:\\Program Files\\LLVM\\bin'
-  if (Test-Path $llvmBin) {
-    if (-not ($env:Path.Split(';') -contains $llvmBin)) {
-      $env:Path = "$env:Path;$llvmBin"
+    $entries = @($Prepend) + @(
+        [Environment]::GetEnvironmentVariable('Path', 'User'),
+        [Environment]::GetEnvironmentVariable('Path', 'Machine'),
+        $env:Path
+    )
+    $paths = @()
+    foreach ($entry in $entries) {
+        foreach ($part in ($entry -split ';')) {
+            $part = [Environment]::ExpandEnvironmentVariables($part.Trim().Trim('"'))
+            if ($part -and $paths -notcontains $part) { $paths += $part }
+        }
     }
-    if (-not $env:LIBCLANG_PATH) {
-      $env:LIBCLANG_PATH = $llvmBin
+    $env:Path = $paths -join ';'
+}
+
+function Add-UserPath {
+    param([string]$Directory)
+
+    if (-not $CheckOnly) {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (@($userPath -split ';') -notcontains $Directory) {
+            $newPath = (@($Directory) + @($userPath -split ';' | Where-Object { $_ })) -join ';'
+            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        }
     }
-    Ensure-UserPathContains $llvmBin
-    Ensure-UserEnvVar -Name 'LIBCLANG_PATH' -Value $llvmBin
+    Update-SessionPath -Prepend @($Directory)
+}
 
-    $clang = Join-Path $llvmBin 'clang.exe'
-    $clangxx = Join-Path $llvmBin 'clang++.exe'
-    if (Test-Path $clang) {
-      $env:CC = $clang
-      Ensure-UserEnvVar -Name 'CC' -Value $clang
+function Get-ToolVersion {
+    param([string]$Command, [string[]]$VersionArguments = @('--version'))
+
+    $path = Get-ApplicationPath $Command
+    if (-not $path) { return $null }
+    $output = (Invoke-Native $path $VersionArguments) -join [Environment]::NewLine
+    if ($output -notmatch '(?<!\d)(\d+\.\d+(?:\.\d+)?)(?!\d)') {
+        throw "Could not determine $Command version from: $output"
     }
-    if (Test-Path $clangxx) {
-      $env:CXX = $clangxx
-      Ensure-UserEnvVar -Name 'CXX' -Value $clangxx
+    return [version]$Matches[1]
+}
+
+function Install-WinGetPackage {
+    param([string]$Id, [string[]]$ExtraArguments = @(), [string]$Architecture = $script:Architecture)
+
+    if ($CheckOnly) { throw "$Id is missing or unsuitable. Rerun setup without -CheckOnly to install it." }
+    $winget = Get-ApplicationPath 'winget.exe'
+    if (-not $winget) {
+        throw 'WinGet is required. Install/update App Installer from Microsoft, then rerun setup.'
     }
-  }
+    $wingetVersion = Get-ToolVersion 'winget.exe'
+    if ($wingetVersion -lt [version]'1.6') { throw 'Update App Installer: setup requires WinGet 1.6 or newer.' }
+
+    Write-Host "-- Installing $Id ($Architecture)" -ForegroundColor Cyan
+    $arguments = @(
+        'install', '--id', $Id, '--exact', '--source', 'winget',
+        '--architecture', $Architecture, '--silent', '--disable-interactivity',
+        '--accept-package-agreements', '--accept-source-agreements'
+    ) + $ExtraArguments
+    # WinGet may report an already installed package or no applicable upgrade.
+    # Callers must still verify that the installed tools actually work.
+    Invoke-Native $winget $arguments -SuccessExitCodes @(
+        0, -1978335189, -1978335135, -1978334963
+    ) | Out-Host
+    Update-SessionPath
 }
 
-Write-Host "-- Installing LLVM/Clang" -ForegroundColor DarkCyan
-winget install @WingetArgs --id LLVM.LLVM | Out-Host
-Add-LLVMToPath
+function Ensure-Tool {
+    param(
+        [string]$Id,
+        [string]$Command,
+        [version]$MinimumVersion = '0.0',
+        [string[]]$ExtraArguments = @()
+    )
 
-# 7) cargo-insta (used by snapshot tests)
-# Ensure MSVC linker is available before building/cargo-install by entering VS dev shell
-Enter-VsDevShell
-$hasLink = $false
-try { & where.exe link | Out-Null; $hasLink = $true } catch {}
-if ($hasLink) {
-  Write-Host "-- Installing cargo-insta" -ForegroundColor DarkCyan
-  & cargo install cargo-insta --locked | Out-Host
-} else {
-  Write-Host "-- Skipping cargo-insta for now (MSVC linker not found yet)" -ForegroundColor Yellow
+    $version = $null
+    try { $version = Get-ToolVersion $Command } catch { Write-Verbose $_ }
+    if (-not $version -or $version -lt $MinimumVersion) {
+        Install-WinGetPackage $Id -ExtraArguments $ExtraArguments
+        $version = Get-ToolVersion $Command
+    }
+    if (-not $version -or $version -lt $MinimumVersion) {
+        throw "$Id did not provide a usable $Command (minimum version $MinimumVersion). Check PATH and rerun setup."
+    }
+    Write-Host "-- $Command $version" -ForegroundColor DarkCyan
 }
 
-if ($SkipBuild) {
-  Write-Host "==> Skipping cargo build (SkipBuild specified)" -ForegroundColor Yellow
-  exit 0
+function Get-WindowsArchitecture {
+    $native = $env:PROCESSOR_ARCHITEW6432
+    if (-not $native) { $native = $env:PROCESSOR_ARCHITECTURE }
+    switch ($native) {
+        'AMD64' { return 'x64' }
+        'ARM64' { return 'arm64' }
+        default { throw "Unsupported Windows architecture '$native'. Use x64 or ARM64 Windows." }
+    }
 }
 
-Write-Host "==> Building workspace (cargo build)" -ForegroundColor Cyan
-pushd "$PSScriptRoot\.." | Out-Null
-try {
-  # Clear RUSTFLAGS if coming from constrained environments
-  $env:RUSTFLAGS = ''
-  Enter-VsDevShell
-  & cargo build
-}
-finally {
-  popd | Out-Null
+function Get-VSInstallation {
+    param([string[]]$RequiredComponents = @())
+
+    $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) { return $null }
+    $arguments = @('-latest', '-products', '*', '-version', '[17.0,)', '-property', 'installationPath')
+    if ($RequiredComponents.Count -gt 0) { $arguments += @('-requires') + $RequiredComponents }
+    $path = (Invoke-Native $vswhere $arguments) -join ''
+    if ($path) { return $path.Trim() }
+    return $null
 }
 
-Write-Host "==> Build complete" -ForegroundColor Green
+function Ensure-VisualStudio {
+    $components = @(
+        'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+        'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+    )
+    if ($script:Architecture -eq 'arm64') {
+        $components += 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+    }
+    $installation = Get-VSInstallation $components
+    if ($installation) { return $installation }
+    if ($CheckOnly) { throw 'MSVC and Windows SDK components are missing. Rerun setup without -CheckOnly.' }
+
+    $installation = Get-VSInstallation
+    if ($installation) {
+        # Modify a suitable existing VS 2022 or newer instance, including full VS.
+        # setup.exe has no --wait option: Start-Process waits for its process tree.
+        $installer = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\setup.exe'
+        $arguments = @('modify', '--installPath', ('"{0}"' -f $installation), '--quiet', '--norestart')
+        foreach ($component in $components) { $arguments += @('--add', $component) }
+        $start = @{
+            FilePath = $installer
+            ArgumentList = $arguments
+            WorkingDirectory = $script:WorkspaceRoot
+            Wait = $true
+            PassThru = $true
+            WindowStyle = 'Hidden'
+        }
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            $start.Verb = 'RunAs'
+        }
+        Write-Host '-- Adding the required MSVC and Windows SDK components' -ForegroundColor Cyan
+        $process = Start-Process @start
+        if ($process.ExitCode -eq 3010) { throw 'Visual Studio requires a restart. Restart Windows and rerun setup.' }
+        if ($process.ExitCode -ne 0) { throw "Visual Studio modification failed with exit code $($process.ExitCode)." }
+    } else {
+        $arguments = @('--quiet', '--wait', '--norestart', '--add', 'Microsoft.VisualStudio.Workload.VCTools')
+        foreach ($component in $components) { $arguments += @('--add', $component) }
+        # The VS bootstrapper is x64 even when it installs native ARM64 tools.
+        Install-WinGetPackage 'Microsoft.VisualStudio.2022.BuildTools' -Architecture 'x64' -ExtraArguments @(
+            '--override', ($arguments -join ' ')
+        )
+    }
+    $installation = Get-VSInstallation $components
+    if (-not $installation) { throw 'Visual Studio setup did not install all required MSVC/SDK components.' }
+    return $installation
+}
+
+function Enter-VisualStudioEnvironment {
+    param([string]$Installation)
+
+    $devCommand = Join-Path $Installation 'Common7\Tools\VsDevCmd.bat'
+    if (-not (Test-Path -LiteralPath $devCommand)) { throw "Visual Studio developer shell is missing: $devCommand" }
+    $command = '"{0}" -no_logo -arch={1} -host_arch={1} >nul && set' -f $devCommand, $script:Architecture
+    # /d disables cmd AutoRun hooks; && prevents importing a failed environment.
+    $lines = Invoke-Native $env:ComSpec @('/d', '/c', $command)
+    $variables = @(
+        'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir',
+        'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSDKLibVersion',
+        'WindowsSdkBinPath', 'WindowsLibPath', 'UniversalCRTSdkDir', 'UCRTVersion'
+    )
+    foreach ($line in $lines) {
+        if ($line -match '^([^=]+)=(.*)$' -and $variables -contains $Matches[1]) {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+        }
+    }
+    if (-not $env:VCToolsInstallDir -or -not $env:WindowsSdkDir -or -not $env:WindowsSDKVersion) {
+        throw 'Visual Studio did not expose the MSVC/Windows SDK environment.'
+    }
+    foreach ($tool in @('cl.exe', 'link.exe', 'rc.exe')) {
+        $path = Get-ApplicationPath $tool
+        if (-not $path) { throw "Visual Studio did not provide $tool for $script:Architecture." }
+        $root = if ($tool -eq 'rc.exe') { $env:WindowsSdkDir } else { $env:VCToolsInstallDir }
+        if (-not $path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$tool resolves outside the selected Visual Studio/SDK installation: $path"
+        }
+    }
+    $sdkVersion = $env:WindowsSDKVersion.TrimEnd('\')
+    $header = Join-Path $env:WindowsSdkDir "Include\$sdkVersion\um\Windows.h"
+    $library = Join-Path $env:WindowsSdkDir "Lib\$sdkVersion\um\$script:Architecture\kernel32.lib"
+    if (-not (Test-Path -LiteralPath $header) -or -not (Test-Path -LiteralPath $library)) {
+        throw "Windows SDK headers/libraries are missing for $script:Architecture. Repair the selected SDK."
+    }
+    Write-Host "-- MSVC and Windows SDK ready ($script:Architecture)" -ForegroundColor DarkCyan
+}
+
+function Test-LibclangArchitecture {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = New-Object IO.BinaryReader($stream)
+    try {
+        if ($reader.ReadUInt16() -ne 0x5A4D) { return $false }
+        $stream.Position = 0x3C
+        $stream.Position = $reader.ReadInt32()
+        if ($reader.ReadUInt32() -ne 0x00004550) { return $false }
+        $machine = $reader.ReadUInt16()
+        $expected = if ($script:Architecture -eq 'arm64') { 0xAA64 } else { 0x8664 }
+        return $machine -eq $expected
+    } catch [IO.EndOfStreamException] {
+        return $false
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Ensure-LLVM {
+    $nativeProgramFiles = $env:ProgramW6432
+    if (-not $nativeProgramFiles) { $nativeProgramFiles = $env:ProgramFiles }
+    $directories = @($env:LIBCLANG_PATH, (Join-Path $nativeProgramFiles 'LLVM\bin'))
+    $clang = Get-ApplicationPath 'clang.exe'
+    if ($clang) { $directories += Split-Path -Parent $clang }
+    $directory = $null
+    foreach ($candidate in $directories) {
+        if ($candidate -and (Test-LibclangArchitecture (Join-Path $candidate 'libclang.dll')) -and
+            (Test-Path -LiteralPath (Join-Path $candidate 'clang.exe'))) {
+            $directory = $candidate
+            break
+        }
+    }
+    if (-not $directory) {
+        Install-WinGetPackage 'LLVM.LLVM'
+        $clang = Get-ApplicationPath 'clang.exe'
+        if ($clang) { $directories = @((Split-Path -Parent $clang)) + $directories }
+        foreach ($candidate in $directories) {
+            if ($candidate -and (Test-LibclangArchitecture (Join-Path $candidate 'libclang.dll')) -and
+                (Test-Path -LiteralPath (Join-Path $candidate 'clang.exe'))) {
+                $directory = $candidate
+                break
+            }
+        }
+    }
+    if (-not $directory) { throw "LLVM did not provide a native $script:Architecture libclang.dll. Check the LLVM installation." }
+    Add-UserPath $directory
+    $env:LIBCLANG_PATH = $directory
+    Invoke-Native (Join-Path $directory 'clang.exe') @('--version') | Out-Host
+    # Do not set CC/CXX: native crates should continue to use MSVC by default.
+}
+
+function Get-RustConfiguration {
+    $python = Get-ApplicationPath 'python.exe'
+    $code = "import json, sys, tomllib; print(json.dumps(tomllib.load(open(sys.argv[1], 'rb'))['toolchain']))"
+    $output = Invoke-Native $python @('-c', $code, (Join-Path $script:WorkspaceRoot 'rust-toolchain.toml'))
+    return ($output -join [Environment]::NewLine) | ConvertFrom-Json
+}
+
+function Ensure-RustToolchain {
+    param($Configuration)
+
+    $hostTriple = if ($script:Architecture -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    $toolchain = "$($Configuration.channel)-$hostTriple"
+    $rustup = Get-ApplicationPath 'rustup.exe'
+    if (-not $CheckOnly) {
+        $arguments = @('toolchain', 'install', $toolchain, '--profile', 'minimal')
+        foreach ($component in $Configuration.components) { $arguments += @('--component', $component) }
+        if ($Configuration.PSObject.Properties['targets']) {
+            foreach ($target in $Configuration.targets) { $arguments += @('--target', $target) }
+        }
+        Invoke-Native $rustup $arguments | Out-Host
+    }
+    $details = (Invoke-Native $rustup @('run', $toolchain, 'rustc', '-vV')) -join [Environment]::NewLine
+    if ($details -notmatch "(?m)^host: $([regex]::Escape($hostTriple))\r?$") {
+        throw "Rust must use the native MSVC host $hostTriple."
+    }
+    $installed = @(Invoke-Native $rustup @('component', 'list', '--toolchain', $toolchain, '--installed'))
+    foreach ($component in $Configuration.components) {
+        if (-not ($installed -match "^$([regex]::Escape($component))(-|$)")) {
+            throw "Rust component '$component' is missing. Rerun setup without -CheckOnly."
+        }
+    }
+    if ($Configuration.PSObject.Properties['targets']) {
+        $targets = @(Invoke-Native $rustup @('target', 'list', '--toolchain', $toolchain, '--installed'))
+        foreach ($target in $Configuration.targets) {
+            if ($targets -notcontains $target) { throw "Rust target '$target' is missing. Rerun setup without -CheckOnly." }
+        }
+    }
+    # Activate the native MSVC toolchain without changing rustup's global default.
+    $env:RUSTUP_TOOLCHAIN = $toolchain
+    Invoke-Native (Get-ApplicationPath 'cargo.exe') @("+$toolchain", '--version') | Out-Host
+    return $toolchain
+}
+
+function Ensure-CargoTool {
+    param([string]$Name, [string]$Toolchain, [string]$CargoHome)
+
+    $command = "$Name.exe"
+    if (-not (Get-ApplicationPath $command)) {
+        if ($CheckOnly) { throw "$Name is missing. Rerun setup without -CheckOnly." }
+        Write-Host "-- Installing $Name (Cargo helper)" -ForegroundColor Cyan
+        Invoke-Native (Get-ApplicationPath 'cargo.exe') @(
+            "+$Toolchain", 'install', '--locked', '--root', $CargoHome, $Name
+        ) | Out-Host
+    }
+    if ($Name -like 'cargo-*') {
+        $subcommand = $Name.Substring('cargo-'.Length)
+        Invoke-Native (Get-ApplicationPath 'cargo.exe') @("+$Toolchain", $subcommand, '--version') | Out-Host
+    } else {
+        Invoke-Native (Get-ApplicationPath $command) @('--version') | Out-Host
+    }
+}
+
+function Ensure-Pnpm {
+    param([string]$Version)
+
+    $command = Get-ApplicationPath 'pnpm.cmd'
+    $current = if ($command) { (Invoke-Native $command @('--version')) -join '' } else { '' }
+    if ($current.Trim() -ne $Version) {
+        if ($CheckOnly) { throw "pnpm $Version is required by package.json. Rerun setup without -CheckOnly." }
+        $npm = Get-ApplicationPath 'npm.cmd'
+        if (-not $npm) { throw 'The Node.js installation did not provide npm.cmd.' }
+        Invoke-Native $npm @('install', '--global', "pnpm@$Version", '--ignore-scripts', '--no-audit', '--no-fund') | Out-Host
+        $prefix = (Invoke-Native $npm @('prefix', '--global')) -join ''
+        Add-UserPath $prefix.Trim()
+        $command = Get-ApplicationPath 'pnpm.cmd'
+        if (-not $command) { throw 'pnpm.cmd was not found after installation. Check the npm global prefix.' }
+        $current = (Invoke-Native $command @('--version')) -join ''
+    }
+    if ($current.Trim() -ne $Version) { throw "pnpm resolved to '$current', but package.json requires $Version." }
+    Write-Host "-- pnpm $Version" -ForegroundColor DarkCyan
+}
+
+function Ensure-Bazelisk {
+    param([string]$BinDirectory)
+
+    if (-not (Get-ApplicationPath 'bazelisk.exe')) { Install-WinGetPackage 'Bazel.Bazelisk' }
+    if (-not (Get-ApplicationPath 'bazelisk.exe')) { throw 'WinGet did not provide bazelisk.exe.' }
+    $shim = Join-Path $BinDirectory 'bazel.cmd'
+    # WinGet exposes bazelisk, whereas the repository recipes invoke bazel.
+    # Keep the wrapper ASCII, including for non-ASCII Windows profile paths.
+    $content = @('@echo off', 'bazelisk.exe %*', 'exit /b %errorlevel%', '') -join ([char]13 + [string][char]10)
+    $existing = if (Test-Path -LiteralPath $shim) { Get-Content -LiteralPath $shim -Raw } else { '' }
+    if ($existing -ne $content) {
+        if ($CheckOnly) { throw 'The bazel.cmd wrapper is missing or outdated. Rerun setup without -CheckOnly.' }
+        New-Item -ItemType Directory -Path $BinDirectory -Force | Out-Null
+        Set-Content -LiteralPath $shim -Value $content -Encoding ASCII -NoNewline
+    }
+    Add-UserPath $BinDirectory
+    # --version downloads the pinned Bazel if necessary, but never builds code.
+    # CheckOnly checks the wrapper above to avoid downloading Bazel.
+    if (-not $CheckOnly) {
+        $version = (Invoke-Native $shim @('--version')) -join ''
+        $expected = (Get-Content -LiteralPath (Join-Path $script:RepositoryRoot '.bazelversion') -Raw).Trim()
+        if ($version.Trim() -ne "bazel $expected") { throw "Bazel version '$version' does not match .bazelversion ($expected)." }
+        Write-Host "-- $version" -ForegroundColor DarkCyan
+    }
+}
+
+function Initialize-WindowsDevelopment {
+    if ($env:OS -ne 'Windows_NT') { throw 'This script requires Windows.' }
+    $script:Architecture = Get-WindowsArchitecture
+    $script:WorkspaceRoot = Split-Path -Parent $PSScriptRoot
+    $script:RepositoryRoot = Split-Path -Parent $script:WorkspaceRoot
+    $package = Get-Content -LiteralPath (Join-Path $script:RepositoryRoot 'package.json') -Raw | ConvertFrom-Json
+    if ($package.packageManager -notmatch '^pnpm@(\d+\.\d+\.\d+)(?:\+|$)') {
+        throw 'package.json must pin a pnpm version in packageManager.'
+    }
+    $pnpmVersion = $Matches[1]
+    if ($package.engines.node -notmatch '^>=(\d+(?:\.\d+){0,2})$') { throw 'Unsupported Node.js engine requirement in package.json.' }
+    $nodeVersion = $Matches[1]
+    if ($nodeVersion -notmatch '\.') { $nodeVersion += '.0' }
+    $nodeMinimum = [version]$nodeVersion
+    $cargoHome = $env:CARGO_HOME
+    if (-not $cargoHome) { $cargoHome = Join-Path $env:USERPROFILE '.cargo' }
+    $cargoHome = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($cargoHome)
+    $env:CARGO_HOME = $cargoHome
+    $cargoBin = Join-Path $cargoHome 'bin'
+    $devBin = Join-Path $env:LOCALAPPDATA 'Codex\dev-tools\bin'
+    Update-SessionPath -Prepend @($cargoBin, $devBin)
+
+    # Older rustup versions can install the active toolchain even for --version.
+    # Only the explicit toolchain-install step is allowed to download Rust.
+    Push-Location -LiteralPath $script:WorkspaceRoot
+    $previousAutoInstall = $env:RUSTUP_AUTO_INSTALL
+    try {
+        $env:RUSTUP_AUTO_INSTALL = '0'
+        Write-Host "==> Codex Windows development tools ($script:Architecture)" -ForegroundColor Cyan
+        Ensure-Tool 'Git.Git' 'git.exe' -MinimumVersion '2.23'
+        # CommandWithArgs, used by just-shell.py, became stable in PowerShell 7.5.
+        Ensure-Tool 'Microsoft.PowerShell' 'pwsh.exe' -MinimumVersion '7.5' -ExtraArguments @('--installer-type', 'wix')
+        # Python 3.11+ provides tomllib; reuse newer Python or install CI's 3.12.
+        Ensure-Tool 'Python.Python.3.12' 'python.exe' -MinimumVersion '3.11' -ExtraArguments @('--scope', 'user')
+        $rustConfiguration = Get-RustConfiguration
+        $installation = Ensure-VisualStudio
+        Ensure-Tool 'Rustlang.Rustup' 'rustup.exe' -MinimumVersion '1.28.1' -ExtraArguments @('--custom', '--default-toolchain none --profile minimal')
+        Add-UserPath $cargoBin
+        Ensure-Tool 'BurntSushi.ripgrep.MSVC' 'rg.exe'
+        Ensure-Tool 'Casey.Just' 'just.exe' -MinimumVersion '1.51.0'
+        Ensure-Tool 'Kitware.CMake' 'cmake.exe' -ExtraArguments @('--installer-type', 'wix')
+        Ensure-Tool 'astral-sh.uv' 'uv.exe' -MinimumVersion '0.11.19'
+        Ensure-Tool 'OpenJS.NodeJS.LTS' 'node.exe' -MinimumVersion $nodeMinimum -ExtraArguments @('--installer-type', 'wix')
+        Ensure-LLVM
+        Ensure-Pnpm $pnpmVersion
+        Ensure-Bazelisk $devBin
+        # Refresh PATH before entering VS, so compiler/linker paths stay first.
+        Enter-VisualStudioEnvironment $installation
+        $toolchain = Ensure-RustToolchain $rustConfiguration
+        foreach ($tool in @('cargo-insta', 'cargo-nextest', 'dotslash')) {
+            Ensure-CargoTool $tool $toolchain $cargoHome
+        }
+        Invoke-Native (Get-ApplicationPath 'just.exe') @('--list') | Out-Null
+        if (-not $CheckOnly) {
+            Invoke-Native (Get-ApplicationPath 'git.exe') @('-C', $script:RepositoryRoot, 'config', '--local', 'core.longpaths', 'true') | Out-Host
+        }
+        Write-Host '==> Development environment verified. Codex was not built.' -ForegroundColor Green
+        Write-Host 'Use this PowerShell session, or rerun with -CheckOnly in a new session to activate MSVC.'
+    } finally {
+        Pop-Location
+        [Environment]::SetEnvironmentVariable('RUSTUP_AUTO_INSTALL', $previousAutoInstall, 'Process')
+    }
+}
+
+Initialize-WindowsDevelopment

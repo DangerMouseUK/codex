@@ -5,9 +5,7 @@ on:
 
 jobs:
   python-sdk-installation:
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-linux-x64
+    runs-on: ${{ github.repository == 'openai/codex' && fromJSON('{"group":"codex-runners","labels":"codex-linux-x64"}') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -36,10 +34,8 @@ jobs:
             '
 
   sdks:
-    runs-on:
-      group: ${{ github.event.repository.name }}-runners
-      labels: ${{ github.event.repository.name }}-linux-x64
-    timeout-minutes: 20
+    runs-on: ${{ github.repository == 'openai/codex' && fromJSON('{"group":"codex-runners","labels":"codex-linux-x64"}') || 'ubuntu-24.04' }}
+    timeout-minutes: ${{ github.repository == 'openai/codex' && 20 || 120 }}
     environment:
       name: bazel
       deployment: false
@@ -54,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev libasound2-dev
 
       - name: Setup pnpm
         uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
@@ -68,6 +64,7 @@ jobs:
           cache: pnpm
 
       - name: Prepare Bazel CI
+        if: github.repository == 'openai/codex'
         id: setup_bazel
         uses: ./.github/actions/prepare-bazel-ci
         with:
@@ -75,6 +72,7 @@ jobs:
           cache-scope: sdk
 
       - name: Build codex and the code-mode host with Bazel
+        if: github.repository == 'openai/codex'
         id: build_bazel
         env:
           BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -117,7 +115,49 @@ jobs:
           install -m 755 "${bazel_output_paths[@]}" "${install_dir}"
           echo "CODEX_EXEC_PATH=${install_dir}/codex" >> "$GITHUB_ENV"
 
-      - name: Warm up Bazel-built codex
+      - name: Install Rust for hosted fork SDK tests
+        if: github.repository != 'openai/codex'
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Prepare hosted fork runtime tools
+        if: github.repository != 'openai/codex'
+        uses: ./.github/actions/setup-ci
+
+      - name: Configure verified V8 artifacts for hosted fork builds
+        if: github.repository != 'openai/codex'
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache hosted fork Cargo builds
+        id: fork_cargo_cache
+        if: github.repository != 'openai/codex'
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ runner.temp }}/sdk-cargo-target
+          key: fork-sdk-cargo-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            fork-sdk-cargo-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
+
+      - name: Build the CLI for hosted fork SDK tests
+        id: fork_build
+        if: github.repository != 'openai/codex'
+        working-directory: codex-rs
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/sdk-cargo-target
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          set -euo pipefail
+          cargo build --locked -p codex-cli -p codex-code-mode-host --bins
+          echo "CODEX_EXEC_PATH=${CARGO_TARGET_DIR}/debug/codex" >> "$GITHUB_ENV"
+
+      - name: Warm up the CLI
         shell: bash
         run: |
           set -euo pipefail
@@ -148,8 +188,20 @@ jobs:
           uv run --only-group dev --frozen --no-sync ruff format --check .
           uv run --only-group dev --frozen --no-sync pytest
 
+      - name: Save successful hosted fork Cargo builds
+        if: always() && !cancelled() && github.repository != 'openai/codex' && steps.fork_build.outcome == 'success' && steps.fork_cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ runner.temp }}/sdk-cargo-target
+          key: fork-sdk-cargo-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
+
       - name: Save bazel repository cache
-        if: always() && !cancelled() && steps.build_bazel.outcome == 'success' && steps.setup_bazel.outputs.repository-cache-hit != 'true'
+        if: always() && !cancelled() && github.repository == 'openai/codex' && steps.build_bazel.outcome == 'success' && steps.setup_bazel.outputs.repository-cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
