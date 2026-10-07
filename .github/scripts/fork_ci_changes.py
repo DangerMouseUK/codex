@@ -11,7 +11,8 @@ def coverage(paths: list[str], *, full: bool = False) -> dict[str, bool]:
         path.startswith("codex-rs/")
         and (
             PurePosixPath(path).suffix == ".rs"
-            or PurePosixPath(path).name in {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
+            or PurePosixPath(path).name
+            in {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
             or path.startswith("codex-rs/.cargo/")
             or path.startswith("codex-rs/.config/")
         )
@@ -41,7 +42,15 @@ def main() -> None:
     else:
         paths = (
             subprocess.check_output(
-                ["git", "diff", "--name-only", "--no-renames", "-z", args.base, args.head]
+                [
+                    "git",
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    args.base,
+                    args.head,
+                ]
             )
             .decode("utf-8")
             .split("\0")

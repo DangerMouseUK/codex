@@ -9,7 +9,11 @@ import unittest
 class CiResultsTests(unittest.TestCase):
     def check(self, needs, *args):
         return subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("check_ci_results.py")), *args],
+            [
+                sys.executable,
+                str(Path(__file__).with_name("check_ci_results.py")),
+                *args,
+            ],
             env={**os.environ, "NEEDS": json.dumps(needs)},
             capture_output=True,
             text=True,

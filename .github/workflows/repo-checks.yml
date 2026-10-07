@@ -34,6 +34,13 @@ jobs:
         shell: pwsh
         run: Save-Module -Name Pester -RequiredVersion 5.7.1 -Repository PSGallery -Path "$env:RUNNER_TEMP/windows-setup-tests" -Force
 
+      - name: Verify repository policies on Windows
+        run: |
+          foreach ($script in @('verify_cargo_workspace_manifests.py', 'verify_tui_core_boundary.py', 'verify_bazel_clippy_lints.py')) {
+            python ".github/scripts/$script"
+            if ($LASTEXITCODE -ne 0) { throw "Repository policy failed: $script" }
+          }
+
       - name: Test Windows setup with mocked installers
         run: |
           Import-Module "$env:RUNNER_TEMP/windows-setup-tests/Pester/5.7.1/Pester.psd1" -Force

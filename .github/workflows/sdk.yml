@@ -130,8 +130,9 @@ jobs:
           target: x86_64-unknown-linux-gnu
 
       - name: Cache hosted fork Cargo builds
+        id: fork_cargo_cache
         if: github.repository != 'openai/codex'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -143,6 +144,7 @@ jobs:
             fork-sdk-cargo-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
 
       - name: Build the CLI for hosted fork SDK tests
+        id: fork_build
         if: github.repository != 'openai/codex'
         working-directory: codex-rs
         env:
@@ -185,6 +187,18 @@ jobs:
           uv run --only-group dev --frozen --no-sync ruff check --output-format=github .
           uv run --only-group dev --frozen --no-sync ruff format --check .
           uv run --only-group dev --frozen --no-sync pytest
+
+      - name: Save successful hosted fork Cargo builds
+        if: always() && !cancelled() && github.repository != 'openai/codex' && steps.fork_build.outcome == 'success' && steps.fork_cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ runner.temp }}/sdk-cargo-target
+          key: fork-sdk-cargo-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
 
       - name: Save bazel repository cache
         if: always() && !cancelled() && github.repository == 'openai/codex' && steps.build_bazel.outcome == 'success' && steps.setup_bazel.outputs.repository-cache-hit != 'true'
