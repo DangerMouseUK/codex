@@ -57,6 +57,20 @@ jobs:
 
       - uses: ./.github/actions/setup-ci
 
+      - name: Test fork coverage selection and CI result policy
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_fork_ci_changes.py'
+          python3 -m unittest discover -s .github/scripts -p 'test_check_ci_results.py'
+
+      - name: Validate hosted fork workflow configuration
+        if: github.repository != 'openai/codex'
+        run: >-
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          -shellcheck= -pyflakes=
+          .github/workflows/fork-ci.yml .github/workflows/blocking-ci.yml
+          .github/workflows/postmerge-ci.yml .github/workflows/repo-checks.yml
+          .github/workflows/sdk.yml
+
       - name: Verify codex-rs Cargo manifests inherit workspace settings
         run: python3 .github/scripts/verify_cargo_workspace_manifests.py
 
