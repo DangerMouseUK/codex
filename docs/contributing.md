@@ -1,5 +1,17 @@
 ## Contributing
 
+This fork focuses on native Windows and PowerShell compatibility. We aim to keep changes focused and stay close to `openai/codex`, so suitable improvements may eventually be shared upstream.
+
+### Working on this fork
+
+Use [this fork's issue tracker](https://github.com/DangerMouseUK/codex/issues) for fork-specific Windows problems and proposals. Include your Windows version, architecture, PowerShell version/edition, terminal, Codex revision, minimal reproduction steps, and expected versus actual behavior. Redact credentials and sensitive logs.
+
+Follow the [Windows native compatibility roadmap](windows-native-roadmap.md) when proposing implementation work. Keep changes focused, preserve macOS/Linux behavior, and include relevant regression coverage and validation results. See the [Windows setup guide](install.md#windows-development-powershell) for development prerequisites.
+
+## Upstream contribution policy
+
+The guidance below is OpenAI's policy for its upstream repository. Check the [latest upstream contribution guide](https://github.com/openai/codex/blob/main/docs/contributing.md) before proposing contributions to OpenAI.
+
 We welcome community contributions through the [openai/codex issue tracker](https://github.com/openai/codex/issues). Bug reports, root-cause analyses, and feature requests help us understand what matters most and improve Codex.
 
 **We do not accept external code contributions or pull requests.**
