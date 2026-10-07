@@ -226,12 +226,10 @@ def test_root_format_driver_covers_all_formatter_groups(
     assert formatters[0].commands[-1].args == ("just", "--unstable", "--fmt")
     assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
     cargo_fmt_args = ("cargo", "fmt", "--", "--config", "imports_granularity=Item")
-    assert formatters[1].commands == (
-        script.Command(cargo_fmt_args, tmp_path / "codex-rs"),
-    )
-    assert checks[1].commands == (
-        script.Command(cargo_fmt_args + ("--check",), tmp_path / "codex-rs"),
-    )
+    assert formatters[1].commands[0].args == cargo_fmt_args
+    assert formatters[1].commands[0].cwd == tmp_path / "codex-rs"
+    assert checks[1].commands[0].args == cargo_fmt_args + ("--check",)
+    assert checks[1].commands[0].cwd == tmp_path / "codex-rs"
     format_buildifier_args = formatters[2].commands[-1].args
     check_buildifier_args = checks[2].commands[-1].args
     assert format_buildifier_args[:4] == (

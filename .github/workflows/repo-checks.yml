@@ -131,7 +131,8 @@ jobs:
       - name: Check formatting (run `just fmt` to fix)
         run: |
           if ! just fmt-check; then
-            uv run --frozen --project scripts ruff format --diff .
+            uv run --frozen --project scripts ruff format --diff . || true
+            uv run --frozen --project sdk/python --only-group format ruff format --diff sdk/python || true
             exit 1
           fi
 
