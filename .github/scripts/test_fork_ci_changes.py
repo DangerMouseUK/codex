@@ -24,7 +24,11 @@ class ForkCoverageTests(unittest.TestCase):
                 self.assertEqual(coverage([path]), {"rust_full": True, "sdk": True})
 
     def test_sdk_and_dependency_changes_require_sdk_coverage(self):
-        for path in ("sdk/python/src/example.py", "sdk/typescript/src/index.ts", "pnpm-lock.yaml"):
+        for path in (
+            "sdk/python/src/example.py",
+            "sdk/typescript/src/index.ts",
+            "pnpm-lock.yaml",
+        ):
             with self.subTest(path=path):
                 self.assertEqual(coverage([path]), {"rust_full": False, "sdk": True})
 

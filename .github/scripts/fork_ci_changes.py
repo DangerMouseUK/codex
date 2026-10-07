@@ -39,9 +39,13 @@ def main() -> None:
         args.full = True
         paths = []
     else:
-        paths = subprocess.check_output(
-            ["git", "diff", "--name-only", "--no-renames", "-z", args.base, args.head]
-        ).decode("utf-8").split("\0")
+        paths = (
+            subprocess.check_output(
+                ["git", "diff", "--name-only", "--no-renames", "-z", args.base, args.head]
+            )
+            .decode("utf-8")
+            .split("\0")
+        )
     for key, value in coverage(paths, full=args.full).items():
         print(f"{key}={str(value).lower()}")
 

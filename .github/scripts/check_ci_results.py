@@ -3,8 +3,8 @@
 """Fail a terminal CI job unless every serialized dependency succeeded.
 
 Parent workflows pass GitHub's `toJSON(needs)` object through the NEEDS
-environment variable. Treat skipped and cancelled dependencies as failures too:
-for a required fan-in job, only an explicit success is safe to accept.
+environment variable. Only explicit success is accepted, except for skipped
+dependencies named with --allow-skipped. Failures and cancellations always fail.
 """
 
 import argparse

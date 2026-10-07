@@ -122,7 +122,11 @@ jobs:
         run: python3 scripts/readme_toc.py README.md
 
       - name: Check formatting (run `just fmt` to fix)
-        run: just fmt-check
+        run: |
+          if ! just fmt-check; then
+            uv run --frozen --project scripts ruff format --diff .
+            exit 1
+          fi
 
       - name: Prettier (run `pnpm run format:fix` to fix)
         run: pnpm run format

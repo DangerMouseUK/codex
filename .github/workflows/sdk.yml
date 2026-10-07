@@ -123,6 +123,12 @@ jobs:
         if: github.repository != 'openai/codex'
         uses: ./.github/actions/setup-ci
 
+      - name: Configure verified V8 artifacts for hosted fork builds
+        if: github.repository != 'openai/codex'
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+
       - name: Cache hosted fork Cargo builds
         if: github.repository != 'openai/codex'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4

@@ -25,17 +25,20 @@ class CiResultsTests(unittest.TestCase):
 
     def test_only_explicit_optional_skips_are_allowed(self):
         self.assertEqual(
-            self.check({"sdk": {"result": "skipped"}}, "--allow-skipped", "sdk"), 0
+            self.check({"sdk": {"result": "skipped"}}, "--allow-skipped", "sdk"),
+            0,
         )
         self.assertNotEqual(
-            self.check({"tests": {"result": "skipped"}}, "--allow-skipped", "sdk"), 0
+            self.check({"tests": {"result": "skipped"}}, "--allow-skipped", "sdk"),
+            0,
         )
 
     def test_optional_failures_and_cancellations_still_fail(self):
         for result in ("failure", "cancelled"):
             with self.subTest(result=result):
                 self.assertNotEqual(
-                    self.check({"sdk": {"result": result}}, "--allow-skipped", "sdk"), 0
+                    self.check({"sdk": {"result": result}}, "--allow-skipped", "sdk"),
+                    0,
                 )
 
 
