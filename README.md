@@ -1,81 +1,113 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Codex CLI - Windows and PowerShell Development Fork
 
----
+An independent fork of [OpenAI's Codex CLI](https://github.com/openai/codex) focused on improving **native Windows and PowerShell compatibility**. Our goal is reliable command execution, developer tooling, and everyday Windows workflows, with suitable improvements potentially contributed upstream.
 
-## Quickstart
+**Status: active development.** This fork builds on OpenAI's existing native Windows support. Full native compatibility is a goal with explicit validation milestones; it is not yet a completed claim.
 
-### Installing and running Codex CLI
+<!-- Begin ToC -->
 
-Run the following on Mac or Linux to install Codex CLI:
+- [Current status](#current-status)
+- [Windows development quickstart](#windows-development-quickstart)
+- [What we are improving](#what-we-are-improving)
+- [Roadmap](#roadmap)
+- [Reporting Windows issues](#reporting-windows-issues)
+- [Upstream relationship](#upstream-relationship)
+- [Documentation and license](#documentation-and-license)
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+<!-- End ToC -->
 
-Run the following on Windows to install Codex CLI:
+## Current status
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+| Area                    | Available today                                                                                  | Validation or work still needed                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| Native execution        | Upstream Windows shell discovery, PowerShell parsing, ConPTY, and native sandbox implementations | End-to-end coverage of the fork's intended Windows workflows             |
+| Developer setup         | Refined setup script with mocked installer tests under Windows PowerShell 5.1 and PowerShell 7   | Clean-machine installation, reruns, and actual ARM64 validation          |
+| Fork CI                 | Standard GitHub-hosted Windows, Linux, and macOS checks, with focused native Rust coverage       | Full-workspace dependency setup and reliable full-suite results          |
+| PowerShell improvements | Defined milestones and completion criteria                                                       | Shell context, syntax quality, quoting, environments, and terminal fixes |
+| Fork releases           | Source checkout                                                                                  | Packaged x64/ARM64 releases and install/update validation                |
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+The [first full-workspace run after our upstream sync](https://github.com/DangerMouseUK/codex/actions/runs/37668380554) failed during native compilation: macOS could not locate GStreamer, Linux could not locate GLib, and Windows could not run the required pkg-config probe for GLib. Passing focused checks does not establish full-workspace compatibility. These dependency gaps are tracked in M1.
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+## Windows development quickstart
+
+This fork currently has no published binary releases. The steps below set up a source checkout for development. You need Git and WinGet available; setup can start from Windows PowerShell 5.1.
+
+Read the [Windows setup guide](./docs/install.md#windows-development-powershell) for the tools installed and environment changes before running setup. Machine-wide installers may request UAC approval.
 
 ```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
+git clone https://github.com/DangerMouseUK/codex.git
+Set-Location codex
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex-rs\scripts\setup-windows.ps1
 ```
 
-Codex CLI can also be installed via the following package managers:
+Setup installs and verifies development tools. It does not build Codex, run its tests, or install workspace JavaScript/Python dependencies. The temporary execution-policy override applies to that PowerShell process.
 
-```shell
-# Install using npm
-npm install -g @openai/codex
+Open PowerShell 7.5 or newer in the checkout, then activate and check the environment before explicitly building and running:
+
+```powershell
+& .\codex-rs\scripts\setup-windows.ps1 -CheckOnly
+Set-Location .\codex-rs
+cargo build --locked -p codex-cli --bin codex
+cargo run --locked -p codex-cli --bin codex -- "explain this codebase to me"
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+`-CheckOnly` does not install tools or change persistent settings. Fresh-machine builds and optional feature dependencies are still being validated; see the status above and [build instructions](./docs/install.md) for the current development path.
 
-Then simply run `codex` to get started.
+The Windows and PowerShell workflow is our primary focus. WSL and Git Bash remain explicit choices for workflows that need them. Our target is to complete ordinary Windows tasks without silently switching shells or requiring a Linux environment.
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+## What we are improving
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+- **Shell awareness:** tell the agent which PowerShell executable and version will actually execute its commands.
+- **Command correctness:** improve syntax, quoting, native arguments, pipelines, output encoding, errors, and exit codes.
+- **Windows integration:** make paths, tool shims, MSVC, virtual environments, MCP servers, hooks, and SDK execution predictable.
+- **Sandbox access:** support permitted Windows workflows while preserving filesystem, network, and approval boundaries.
+- **Terminal behavior:** improve interactive input, clipboard handling, streaming, Ctrl-C, and process cleanup.
+- **Native development:** provide repeatable setup, builds, tests, and packaging on x64 and ARM64.
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+These are work areas, not a list of completed fixes. Windows improvements should preserve macOS and Linux behavior and reuse the existing cross-platform architecture.
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+## Roadmap
 
-</details>
+The [Windows native compatibility roadmap](./docs/windows-native-roadmap.md) contains the full checklists, dependencies, code areas, and acceptance criteria.
 
-### Using Codex with your ChatGPT plan
+| Milestones | Outcome                                                                       |
+| ---------- | ----------------------------------------------------------------------------- |
+| M0-M1      | Measured Windows baseline, reproducible failures, and reliable native CI      |
+| M2-M3      | Accurate shell context and dependable PowerShell execution                    |
+| M4-M6      | Predictable environments, sandbox/filesystem access, and terminal interaction |
+| M7-M8      | Native contributor workflows and parity for advertised Windows features       |
+| M9-M10     | Tested packages, actual ARM64 execution, and release acceptance               |
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+The next work is **M0 and M1**: establish the support matrix and regression fixtures, then resolve full-CI dependency setup. The milestones remain open until their completion criteria have evidence.
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+The proposed primary target is Windows 11 with PowerShell 7 on x64 and ARM64. Windows PowerShell 5.1 bootstrap/fallback behavior, terminal support, and optional features have separate validation requirements in the roadmap.
 
-## Docs
+## Reporting Windows issues
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
+Report fork-specific problems in [this fork's issue tracker](https://github.com/DangerMouseUK/codex/issues). Search existing issues first and include:
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+- Windows version and whether the machine is x64 or ARM64.
+- PowerShell version and edition, plus the executable being used.
+- Terminal application, Codex version, and fork commit where available.
+- Minimal reproduction steps, the command that failed, and expected versus actual behavior.
+- Sandbox mode, relevant tool versions, and redacted errors or logs.
+
+Please distinguish native Windows execution from WSL or Git Bash. Remove credentials and other sensitive information from reports. For security vulnerabilities, follow the [security policy](./SECURITY.md).
+
+See the [contributing guide](./docs/contributing.md) for the fork's focus and OpenAI's separate upstream contribution policy.
+
+## Upstream relationship
+
+Codex CLI is developed by OpenAI. This fork tracks [openai/codex](https://github.com/openai/codex) while developing focused Windows and PowerShell improvements. We aim to keep changes reviewable and potentially share suitable fixes, tests, and root-cause analyses with OpenAI over time, subject to its contribution policy.
+
+OpenAI's installers, releases, and the npm package `@openai/codex` install **official upstream Codex**, not this fork. For official installation and product usage, see the [upstream README](https://github.com/openai/codex#readme) and [Codex documentation](https://developers.openai.com/codex).
+
+## Documentation and license
+
+- [Windows setup and build instructions](./docs/install.md#windows-development-powershell)
+- [Windows native compatibility roadmap](./docs/windows-native-roadmap.md)
+- [Fork CI coverage](./.github/workflows/README.md#forks)
+- [Contributing and reporting problems](./docs/contributing.md)
+- [Official Codex documentation](https://developers.openai.com/codex)
+
+This fork retains the upstream [Apache-2.0 License](./LICENSE) and [notices](./NOTICE). Credit for Codex and its existing platform support belongs to OpenAI and the project's contributors.
