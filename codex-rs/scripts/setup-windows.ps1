@@ -464,7 +464,7 @@ function Initialize-WindowsDevelopment {
         Ensure-Tool 'BurntSushi.ripgrep.MSVC' 'rg.exe'
         Ensure-Tool 'Casey.Just' 'just.exe' -MinimumVersion '1.51.0'
         Ensure-Tool 'Kitware.CMake' 'cmake.exe' -ExtraArguments @('--installer-type', 'wix')
-        Ensure-Tool 'astral-sh.uv' 'uv.exe' -MinimumVersion '0.11.19'
+        Ensure-Tool 'astral-sh.uv' 'uv.exe' -MinimumVersion '0.13.5'
         Ensure-Tool 'OpenJS.NodeJS.LTS' 'node.exe' -MinimumVersion $nodeMinimum -ExtraArguments @('--installer-type', 'wix')
         Ensure-LLVM
         Ensure-Pnpm $pnpmVersion

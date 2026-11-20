@@ -112,10 +112,12 @@ async fn hook_shell_startup_does_not_stop_on_controlling_terminal() {
     )]);
     let handler = ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::SessionStart,
         matcher: None,
         timeout_sec: 2,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: AbsolutePathBuf::try_from(temp.path().join("hooks.json"))
             .expect("absolute hook configuration path")
@@ -216,10 +218,12 @@ async fn cmd_shell_runs_quoted_hook_command_path() {
     let env = HashMap::new();
     let handler = ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::SessionStart,
         matcher: None,
         timeout_sec: 10,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: source_path.into(),
         source: HookSource::User,
@@ -266,10 +270,12 @@ async fn fast_exiting_hook_preserves_stdout_when_stdin_is_not_consumed() {
     let env = HashMap::new();
     let handler = ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::SessionStart,
         matcher: None,
         timeout_sec: 10,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: source_path.into(),
         source: HookSource::User,
@@ -354,10 +360,12 @@ async fn command_hook_does_not_expose_configured_noise_auth_token() {
     ]);
     let handler = ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::SessionStart,
         matcher: None,
         timeout_sec: 10,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: source_path.into(),
         source: HookSource::User,
@@ -492,10 +500,12 @@ fn write_handler(temp: &TempDir, source: &str) -> ConfiguredHandler {
     std::fs::write(&script_path, source).expect("write async test hook");
     ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::UserPromptSubmit,
         matcher: None,
         timeout_sec: 10,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: AbsolutePathBuf::try_from(temp.path().join("hooks.json"))
             .expect("absolute test hook path")
@@ -512,9 +522,11 @@ fn write_handler(temp: &TempDir, source: &str) -> ConfiguredHandler {
 
 async fn schedule(runtime: &CommandHookRuntime, handler: ConfiguredHandler, cwd: &Path) {
     let engine = ClaudeHooksEngine {
-        handlers: vec![handler],
-        warnings: Vec::new(),
-        required_load_errors: Vec::new(),
+        enabled: true,
+        handlers: Arc::new(vec![handler]),
+        hook_entries: Default::default(),
+        warnings: Arc::default(),
+        required_load_errors: Arc::default(),
         command_runtime: runtime.clone(),
         mcp_executor: mcp_executor(),
     };

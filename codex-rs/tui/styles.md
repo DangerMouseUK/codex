@@ -9,7 +9,9 @@
 - **Keyboard hints:** Use `key_hint` span helpers for compact, uniformly bold shortcut labels
   and readable secondary descriptions. Include `+`, `/`, and chord separators in the label's
   emphasis. The `?` shortcut reference uses readable accent-colored keys
-  without bold. Separate composer footer actions with ` · `.
+  without bold. Separate composer footer actions with `·`.
+  For example, build `esc close` from the Escape binding's display label and the action
+  `close`. Don't type `Esc` or choose a separate key color in a view or mockup.
 
 # Foreground colors
 

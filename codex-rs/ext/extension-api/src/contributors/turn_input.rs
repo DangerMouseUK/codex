@@ -19,10 +19,12 @@ pub struct TurnInputEnvironment<'a> {
 /// Turn facts supplied before the host records turn-local model input items.
 #[derive(Clone)]
 pub struct TurnInputContext<'a> {
+    /// Prepared extension snapshots and read routes for the step processing this input.
+    pub step_store: &'a crate::ExtensionData,
     /// Stable host-owned turn identifier.
     pub turn_id: String,
-    /// User input submitted for this turn.
-    pub user_input: Vec<UserInput>,
+    /// User input submitted for this turn, borrowed from the host for the contribution.
+    pub user_input: &'a [UserInput],
     /// Resolved turn environments, in host priority order.
     pub environments: Vec<TurnInputEnvironment<'a>>,
 }

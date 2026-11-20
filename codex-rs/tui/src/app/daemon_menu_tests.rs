@@ -81,8 +81,9 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
     };
     app.chat_widget.remote_connection = Some(RemoteConnectionStatus {
         address: "local".into(),
-        version: "v0.153.0".into(),
+        version: Some("v0.153.0".into()),
         is_local_daemon: true,
+        is_managed_daemon: true,
     });
     app.initialize_server_version_notice("0.154.0", Some("0.153.0"));
     let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
@@ -99,7 +100,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         (100, DaemonUpdateSource::ThisCli, "daemon_cli_confirmation"),
     ] {
         app.daemon_cli_executable = executable.clone();
-        app.open_daemon_menu();
+        app.open_daemon_menu(/*policy_error*/ None);
         if source == DaemonUpdateSource::PublicStable {
             insta::assert_snapshot!(
                 "daemon_menu",
@@ -139,6 +140,100 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         );
     }
 
+    app.daemon_cli_executable = executable.clone();
+    app.open_daemon_menu(/*policy_error*/ None);
+    let mut terminal = crate::custom_terminal::Terminal::with_options(
+        crate::test_backend::VT100Backend::new(/*width*/ 120, /*height*/ 30),
+    )
+    .unwrap();
+    let area = Rect::new(0, 0, 120, 30);
+    terminal.set_viewport_area(area);
+    crate::terminal_palette::with_test_default_colors(
+        crate::terminal_probe::DefaultColors {
+            fg: (229, 229, 229),
+            bg: (30, 40, 56),
+        },
+        || {
+            terminal
+                .draw(|frame| app.chat_widget.render(area, frame.buffer_mut()))
+                .unwrap()
+        },
+    );
+    app.chat_widget.handle_key_event(KeyCode::Down.into());
+    app.chat_widget.handle_key_event(KeyCode::Down.into());
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        AppEvent::ConfirmDaemonRestart
+    ));
+    app.confirm_daemon_restart();
+    insta::assert_snapshot!(
+        "daemon_restart_confirmation",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+    crate::terminal_palette::with_test_default_colors(
+        crate::terminal_probe::DefaultColors {
+            fg: (229, 229, 229),
+            bg: (30, 40, 56),
+        },
+        || {
+            // Simulate a terminal that erased the menu's blank tails with its default
+            // background rather than the cached panel color.
+            use std::io::Write;
+            for y in 0..area.height {
+                write!(terminal.backend_mut(), "\x1b[{};25H\x1b[0m\x1b[K", y + 1).unwrap();
+            }
+            terminal
+                .draw(|frame| app.chat_widget.render(area, frame.buffer_mut()))
+                .unwrap();
+            let expected = crate::custom_terminal::test_support::last_rendered_buffer(&terminal);
+            let screen = terminal.backend().vt100().screen();
+            for y in 0..area.height {
+                for x in 24..96 {
+                    let expected_bg = match expected[(x, y)].bg {
+                        ratatui::style::Color::Rgb(r, g, b) => vt100::Color::Rgb(r, g, b),
+                        ratatui::style::Color::Reset => vt100::Color::Default,
+                        _ => continue,
+                    };
+                    assert_eq!(
+                        screen.cell(y, x).unwrap().bgcolor(),
+                        expected_bg,
+                        "at {x}, {y}: {:?}",
+                        expected[(x, y)]
+                    );
+                }
+            }
+        },
+    );
+    // Cancel is the default; a confirmed restart stays in the TUI.
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    assert!(rx.try_recv().is_err());
+    app.confirm_daemon_restart();
+    app.chat_widget.handle_key_event(KeyCode::Down.into());
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    assert!(matches!(rx.try_recv().unwrap(), AppEvent::RunDaemonRestart));
+
+    // A local socket alone does not mean Codex can restart its owner.
+    app.chat_widget
+        .remote_connection
+        .as_mut()
+        .unwrap()
+        .is_managed_daemon = false;
+    app.open_daemon_menu(/*policy_error*/ None);
+    insta::assert_snapshot!(
+        "daemon_unmanaged",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+    app.chat_widget.handle_key_event(KeyCode::Down.into());
+    app.chat_widget.handle_key_event(KeyCode::Down.into());
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        AppEvent::ConfirmDaemonUpdate(_)
+    ));
+    app.confirm_daemon_restart();
+    assert!(rx.try_recv().is_err());
+
     // Maintenance remains available when startup selects the embedded server.
     app.app_server_target = AppServerTarget::Embedded;
     app.chat_widget.remote_connection = None;
@@ -147,7 +242,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         DaemonUpdateSource::PublicStable,
         DaemonUpdateSource::ThisCli,
     ] {
-        app.open_daemon_menu();
+        app.open_daemon_menu(/*policy_error*/ None);
         if source == DaemonUpdateSource::PublicStable {
             insta::assert_snapshot!(
                 "daemon_disconnected",
@@ -177,7 +272,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
     // The full CLI can have any filename; capability comes from its entry point.
     app.daemon_cli_executable =
         Some(AbsolutePathBuf::from_absolute_path(package.path().join("bin/codex-tui")).unwrap());
-    app.open_daemon_menu();
+    app.open_daemon_menu(/*policy_error*/ None);
     insta::assert_snapshot!(
         "daemon_unpackaged_cli",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -189,7 +284,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
     ));
 
     app.daemon_cli_executable = None;
-    app.open_daemon_menu();
+    app.open_daemon_menu(/*policy_error*/ None);
     insta::assert_snapshot!(
         "daemon_no_cli_handoff",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -213,10 +308,11 @@ async fn unavailable_daemon_menu_offers_guidance_without_update_actions() {
     };
     app.chat_widget.remote_connection = Some(RemoteConnectionStatus {
         address: "ws://example.test:1234".into(),
-        version: "v0.153.0".into(),
+        version: Some("v0.153.0".into()),
         is_local_daemon: false,
+        is_managed_daemon: false,
     });
-    app.open_daemon_menu();
+    app.open_daemon_menu(/*policy_error*/ None);
     insta::assert_snapshot!(
         "daemon_remote_guidance",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -224,4 +320,18 @@ async fn unavailable_daemon_menu_offers_guidance_without_update_actions() {
     app.chat_widget.handle_key_event(KeyCode::Enter.into());
     assert!(rx.try_recv().is_err());
     assert_eq!(app.pending_update_action, None);
+}
+
+#[tokio::test]
+async fn managed_policy_removes_daemon_update_actions() {
+    let mut app = make_test_app().await;
+    app.daemon_cli_executable =
+        Some(AbsolutePathBuf::from_absolute_path(std::env::current_exe().unwrap()).unwrap());
+    app.open_daemon_menu(Some(
+        "Daemon updates are disabled by managed policy (features.daemon_updates = false).",
+    ));
+    insta::assert_snapshot!(
+        "daemon_updates_disabled",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
 }

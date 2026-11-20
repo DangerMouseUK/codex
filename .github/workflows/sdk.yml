@@ -3,6 +3,10 @@ name: sdk
 on:
   workflow_call:
 
+env:
+  CODEX_BAZEL_GCS_BUCKET: ${{ secrets.CODEX_BAZEL_GCS_BUCKET }}
+  CODEX_BAZEL_GCS_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.CODEX_BAZEL_GCS_WORKLOAD_IDENTITY_PROVIDER }}
+
 jobs:
   python-sdk-installation:
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON('{"group":"codex-runners","labels":"codex-linux-x64"}') || 'ubuntu-24.04' }}
@@ -26,7 +30,7 @@ jobs:
             python:3.12-slim \
             sh -euxc '
               python -m venv /tmp/build
-              /tmp/build/bin/python -m pip install uv==0.11.3
+              /tmp/build/bin/python -m pip install --only-binary=:all: --require-hashes -r tests/requirements-uv.txt
               /tmp/build/bin/uv build --wheel --out-dir /tmp/dist
               python -m venv /tmp/installed
               /tmp/build/bin/uv pip install --python /tmp/installed/bin/python /tmp/dist/*.whl
@@ -35,7 +39,10 @@ jobs:
 
   sdks:
     runs-on: ${{ github.repository == 'openai/codex' && fromJSON('{"group":"codex-runners","labels":"codex-linux-x64"}') || 'ubuntu-24.04' }}
-    timeout-minutes: ${{ github.repository == 'openai/codex' && 20 || 120 }}
+    # Keep the Bazel CLI build advisory until the public build and cache rollout is verified.
+    # Upstream callers grant cache authentication; fork callers retain read-only permissions.
+    continue-on-error: ${{ github.repository == 'openai/codex' }}
+    timeout-minutes: ${{ github.repository == 'openai/codex' && 90 || 120 }}
     environment:
       name: bazel
       deployment: false
@@ -60,7 +67,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: pnpm
 
       - name: Prepare Bazel CI
@@ -74,13 +81,11 @@ jobs:
       - name: Build codex and the code-mode host with Bazel
         if: github.repository == 'openai/codex'
         id: build_bazel
-        env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           # Use the shared CI wrapper so fork PRs fall back cleanly when
-          # BuildBuddy credentials are unavailable. This workflow needs the
+          # This workflow needs the
           # built binaries on disk afterwards, so ask the wrapper to override
           # CI's default remote_download_minimal behavior.
           ./.github/scripts/run-bazel-ci.sh \
@@ -117,7 +122,7 @@ jobs:
 
       - name: Install Rust for hosted fork SDK tests
         if: github.repository != 'openai/codex'
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
 
       - name: Prepare hosted fork runtime tools
         if: github.repository != 'openai/codex'
@@ -154,7 +159,7 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: |
           set -euo pipefail
-          cargo build --locked -p codex-cli -p codex-code-mode-host --bins
+          cargo build --locked -p codex-cli -p codex-code-mode-host -p codex-exec-server --bins
           echo "CODEX_EXEC_PATH=${CARGO_TARGET_DIR}/debug/codex" >> "$GITHUB_ENV"
 
       - name: Warm up the CLI
@@ -176,9 +181,9 @@ jobs:
         run: pnpm -r --filter ./sdk/typescript run test
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.11.3"
+          version: "0.13.5"
 
       - name: Test Python SDK against the same CLI
         working-directory: sdk/python

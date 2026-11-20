@@ -99,10 +99,12 @@ fn error(text: &str) -> HookOutputEntry {
 fn handler() -> ConfiguredHandler {
     ConfiguredHandler {
         builtin: false,
+        plugin_trust: None,
         event_name: HookEventName::Interrupt,
         matcher: None,
         timeout_sec: 600,
         status_message: None,
+        on_failure: Default::default(),
         additional_context_limit: Default::default(),
         source_path: test_path_buf("/tmp/hooks.json").abs().into(),
         source: codex_protocol::protocol::HookSource::User,
@@ -117,6 +119,8 @@ fn handler() -> ConfiguredHandler {
 
 fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
     HandlerRunResult {
+        structured_content: None,
+        context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
         started_at: 1,
         completed_at: 2,
         duration_ms: 1,

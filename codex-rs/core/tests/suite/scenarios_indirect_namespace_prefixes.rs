@@ -1,4 +1,4 @@
-//! Catalog namespace and MCP server prefixes follow the current model without changing dispatch.
+//! Catalog function and namespace prefixes follow the current model without changing dispatch.
 
 use super::super::code_mode::custom_tool_output_last_non_empty_text;
 use super::super::rmcp_client::remote_aware_environment_id;
@@ -46,7 +46,6 @@ async fn catalog_namespace_prefixes_follow_the_selected_model(
             .features
             .enable(Feature::MultiAgentV2)
             .expect("enable MAv2");
-        config.multi_agent_v2.non_code_mode_only = false;
         config.multi_agent_v2.root_agent_usage_hint_text = Some("Coordinate sub-agents.".into());
         config
             .mcp_servers
@@ -64,6 +63,34 @@ async fn catalog_namespace_prefixes_follow_the_selected_model(
             )]))
             .expect("MCP fixture allowed");
     });
+    if include_search {
+        // Four maps contribute 508 + 1 + 1 + 1 + 1 bytes. Count both matching
+        // MCP selectors and the unused built-in selector, regardless of rendered copies.
+        for (slug, extra, limit) in [
+            ("prefixes-at-budget", "", None),
+            ("prefixes-over-budget", "x", None),
+            ("prefixes-raised-budget", "x", Some(513)),
+        ] {
+            builder = builder.with_model_info_override(slug, move |model| {
+                model.tool_mode = Some(tool_mode);
+                model.supports_search_tool = true;
+                model.model_messages.as_mut().expect("model messages").tools = Some(
+                    serde_json::from_value(json!({
+                        "description_prefix_budget_bytes": limit,
+                        "functions_namespace_functions_description_prefixes": {
+                            "exec": format!(" {}{extra} ", "é".repeat(254)), "view_image": "v"
+                        },
+                        "indirect_description_prefixes": {
+                            "namespaces": {"mcp__reports_one": "m"},
+                            "builtin_tool_namespaces": {"unavailable": "b"},
+                            "mcp_servers": {"reports.one": "m"}
+                        }
+                    }))
+                    .expect("prefix budget catalog"),
+                );
+            });
+        }
+    }
     for (slug, prefixes, mcp_prefix) in [
         (
             "prefixes-conflicting",
@@ -75,22 +102,24 @@ async fn catalog_namespace_prefixes_follow_the_selected_model(
             json!({"functions": "", "collaboration": ""}),
             "",
         ),
-        (
-            "gpt-5.5",
-            json!({
-                "functions": "  Functions context.  ",
-                "collaboration": "Agents context.",
-            }),
-            "Reports context.",
-        ),
+        ("gpt-5.5", json!({}), "Reports context."),
     ] {
         builder = builder.with_model_info_override(slug, move |model| {
             model.tool_mode = Some(tool_mode);
+            model.multi_agent_tools_in_code_mode = Some(true);
             model.supports_search_tool = include_search;
             model.model_messages.as_mut().expect("model messages").tools = Some(
                 serde_json::from_value(json!({
+                    "functions_namespace_functions_description_prefixes": if slug == "gpt-5.5" {
+                        json!({"exec": "Exec guidance.", "view_image": "Image guidance.",
+                            "list_agents": "Wrong namespace.", "echo": "Wrong namespace."})
+                    } else { json!({}) },
                     "indirect_description_prefixes": {
                         "namespaces": prefixes,
+                        "builtin_tool_namespaces": if slug == "gpt-5.5" {
+                            json!({"functions": "Functions context.", "collaboration": "Agents context.",
+                                "mcp__reports_one": "Built-ins only."})
+                        } else { json!({}) },
                         "mcp_servers": {"reports.one": mcp_prefix},
                     },
                 }))
@@ -169,6 +198,7 @@ text({descriptions, echo: report.structuredContent.echo, agent: agents.agents[0]
                 .expect("exec"),
         );
         let description = exec["description"].as_str().expect("description");
+        assert_eq!(description.starts_with("Exec guidance.\n\n"), index == 0);
         for &prefix in &prefixes {
             assert_eq!(
                 description.matches(prefix).count(),
@@ -181,6 +211,19 @@ text({descriptions, echo: report.structuredContent.echo, agent: agents.agents[0]
                 .iter()
                 .all(|prefix| !json!(tools).to_string().contains(*prefix))
         );
+        if index == 0 {
+            for tool in &mut tools {
+                if tool["name"] == "view_image" {
+                    tool["description"] = json!(
+                        tool["description"]
+                            .as_str()
+                            .expect("tool description")
+                            .strip_prefix("Image guidance.\n\n")
+                            .expect("function prefix")
+                    );
+                }
+            }
+        }
         tools
     });
     assert_eq!(direct_specs[0], direct_specs[1]);
@@ -207,23 +250,24 @@ text({descriptions, echo: report.structuredContent.echo, agent: agents.agents[0]
         outputs.push(output);
     }
     let mut expected = outputs[1].clone();
-    for (description, prefix) in expected["descriptions"]
-        .as_array_mut()
-        .expect("tool descriptions")
-        .iter_mut()
-        .zip(prefixes)
-    {
-        *description = json!(format!(
-            "{prefix}\n\n{}",
-            description.as_str().expect("tool description")
-        ));
-    }
+    expected["descriptions"][0] = json!(format!(
+        "Image guidance.\n\n{}",
+        expected["descriptions"][0]
+            .as_str()
+            .expect("tool description")
+    ));
+    expected["descriptions"][2] = json!(format!(
+        "Reports context.\n\n{}",
+        expected["descriptions"][2]
+            .as_str()
+            .expect("MCP tool description")
+    ));
     assert_eq!(outputs[0], expected);
     if tool_mode == ToolMode::CodeModeOnly {
         insta::assert_snapshot!(
             "catalog_indirect_namespace_prefixes",
             context_snapshot::format_request_history_snapshot(
-                "Catalog namespace and raw MCP server prefixes annotate embedded docs and ALL_TOOLS; a model switch clears them without changing nested dispatch.",
+                "Function prefixes annotate individual tools. Built-in namespace prefixes annotate headers. MCP guidance also appears in flat entries. A model switch clears both without changing dispatch.",
                 &requests,
                 &ContextSnapshotOptions::default()
                     .rewrite_known_segments()
@@ -269,6 +313,51 @@ text({descriptions, echo: report.structuredContent.echo, agent: agents.agents[0]
             requests.len(),
             "conflicting prefixes must fail before another model request",
         );
+    }
+    if include_search {
+        for (slug, accepted) in [
+            ("prefixes-at-budget", true),
+            ("prefixes-raised-budget", true),
+            ("prefixes-over-budget", false),
+        ] {
+            let mock = responses::mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    responses::ev_assistant_message("budget", "Done."),
+                    responses::ev_completed("budget"),
+                ]),
+            )
+            .await;
+            test.codex
+                .start_or_steer_turn(
+                    TurnInputRequest::user_input(vec![UserInput::Text {
+                        text: "Check the prefix budget.".into(),
+                        text_elements: vec![],
+                    }])
+                    .with_thread_settings(ThreadSettingsOverrides {
+                        model: Some(slug.into()),
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            if accepted {
+                assert_eq!(completed.error, None);
+                assert_eq!(mock.requests().len(), 1);
+            } else {
+                assert_eq!(
+                    completed.error.expect("over budget").message,
+                    "Model catalog tool description prefixes total 513 UTF-8 bytes, exceeding description_prefix_budget_bytes (512)"
+                );
+                assert!(mock.requests().is_empty());
+            }
+        }
     }
     test.codex.shutdown_and_wait().await?;
     Ok(())

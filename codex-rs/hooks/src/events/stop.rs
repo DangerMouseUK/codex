@@ -8,7 +8,6 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
-use codex_protocol::protocol::HookSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Map;
 use serde_json::Value;
@@ -70,24 +69,7 @@ impl StopHookTarget {
             .into_iter()
             .filter(|handler| {
                 !matches!(self, Self::MemoryConsolidation)
-                    || matches!(
-                        handler.source_path,
-                        HandlerSourcePath::ExecutorScoped { .. }
-                    )
-                    || match handler.source {
-                        HookSource::User
-                        | HookSource::Project
-                        | HookSource::SessionFlags
-                        | HookSource::Plugin => false,
-                        HookSource::System
-                        | HookSource::Mdm
-                        | HookSource::CloudRequirements
-                        | HookSource::CloudManagedConfig
-                        | HookSource::LegacyManagedConfigFile
-                        | HookSource::LegacyManagedConfigMdm
-                        // Required hooks can have unknown attribution; retain them fail-closed.
-                        | HookSource::Unknown => true,
-                    }
+                    || handler.runs_for_memory_consolidation()
             })
             .collect()
     }
@@ -120,7 +102,12 @@ pub(crate) fn preview(
         .target
         .select_handlers(handlers)
         .into_iter()
-        .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
+        .filter(|handler| {
+            !matches!(
+                handler.source_path,
+                HandlerSourcePath::ExecutorScoped { .. }
+            )
+        })
         .map(|handler| dispatcher::running_summary(&handler))
         .collect()
 }
@@ -147,7 +134,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                 HandlerSourcePath::ExecutorScoped { .. }
             )
     });
-    let input_json = match request.target {
+    let input = match request.target {
         StopHookTarget::Stop | StopHookTarget::MemoryConsolidation => {
             let input = StopCommandInput {
                 session_id: request.session_id.to_string(),
@@ -162,8 +149,8 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                     request.last_assistant_message.clone(),
                 ),
             };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
+            match serde_json::to_value(input) {
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -196,8 +183,8 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
                     request.last_assistant_message.clone(),
                 ),
             };
-            match serde_json::to_string(&input) {
-                Ok(input_json) => input_json,
+            match serde_json::to_value(input) {
+                Ok(input) => input,
                 Err(error) => {
                     return serialization_failure_outcome(
                         common::serialization_failure_hook_events(
@@ -214,7 +201,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
     let results = dispatcher::execute_handlers_with_metadata(
         engine,
         matched,
-        input_json.clone(),
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id.clone()),
         request.request_metadata.as_ref(),
@@ -226,7 +213,7 @@ pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> Sto
         dispatcher::execute_handlers_with_metadata(
             engine,
             executor_cleanup,
-            input_json,
+            &input,
             request.cwd.as_path(),
             Some(request.turn_id),
             request.request_metadata.as_ref(),
@@ -384,16 +371,23 @@ fn parse_completed(
         },
     }
 
+    if let Some(reason) = common::apply_failure_policy(handler, &mut status, &mut entries) {
+        should_block = true;
+        block_reason = Some(reason.clone());
+        continuation_prompt = Some(reason);
+    }
+
     let completed = HookCompletedEvent {
         turn_id,
         run: dispatcher::completed_summary(handler, &run_result, status, entries),
     };
     let continuation_fragments = continuation_prompt
         .map(|prompt| {
-            vec![HookPromptFragment::from_single_hook(
-                prompt,
-                completed.run.id.clone(),
-            )]
+            vec![HookPromptFragment {
+                text: prompt,
+                hook_run_id: completed.run.id.clone(),
+                metadata: run_result.context_metadata,
+            }]
         })
         .unwrap_or_default();
 
@@ -447,13 +441,26 @@ fn aggregate_results<'a>(
 }
 
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> StopOutcome {
+    let block_reason = common::failure_block_reason(&hook_events);
+    let continuation_fragments = hook_events
+        .iter()
+        .filter(|event| event.run.status == HookRunStatus::Blocked)
+        .map(|event| HookPromptFragment {
+            text: format!(
+                "{:?} hook failed. This hook is configured to block continuation on failure.",
+                event.run.event_name
+            ),
+            hook_run_id: event.run.id.clone(),
+            metadata: codex_protocol::models::ContentItemMetadata::harness(),
+        })
+        .collect();
     StopOutcome {
         hook_events,
         should_stop: false,
         stop_reason: None,
-        should_block: false,
-        block_reason: None,
-        continuation_fragments: Vec::new(),
+        should_block: block_reason.is_some(),
+        block_reason,
+        continuation_fragments,
     }
 }
 
@@ -497,6 +504,7 @@ mod tests {
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
+                    metadata: codex_protocol::models::ContentItemMetadata::harness(),
                 }],
             }
         );
@@ -574,6 +582,7 @@ mod tests {
                 continuation_fragments: vec![HookPromptFragment {
                     text: "retry with tests".to_string(),
                     hook_run_id: parsed.completed.run.id.clone(),
+                    metadata: codex_protocol::models::ContentItemMetadata::harness(),
                 }],
             }
         );
@@ -693,10 +702,12 @@ mod tests {
     fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::Stop,
             matcher: None,
             timeout_sec: 600,
             status_message: None,
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
@@ -711,6 +722,8 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            structured_content: None,
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

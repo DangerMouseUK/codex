@@ -8,6 +8,7 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde_json::Value;
 
 use super::common;
 use crate::engine::ClaudeHooksEngine;
@@ -86,17 +87,19 @@ pub(crate) async fn run_pre(
         };
     }
 
-    let input_json = match pre_command_input_json(&request) {
-        Ok(input_json) => input_json,
+    let input = match pre_command_input(&request) {
+        Ok(input) => input,
         Err(error) => {
+            let hook_events = common::serialization_failure_hook_events(
+                matched,
+                Some(request.turn_id),
+                format!("failed to serialize pre compact hook input: {error}"),
+            );
+            let stop_reason = common::failure_block_reason(&hook_events);
             return PreCompactOutcome {
-                hook_events: common::serialization_failure_hook_events(
-                    matched,
-                    Some(request.turn_id),
-                    format!("failed to serialize pre compact hook input: {error}"),
-                ),
-                should_stop: false,
-                stop_reason: None,
+                hook_events,
+                should_stop: stop_reason.is_some(),
+                stop_reason,
             };
         }
     };
@@ -104,7 +107,7 @@ pub(crate) async fn run_pre(
     let results = dispatcher::execute_handlers(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_pre_completed,
@@ -121,9 +124,9 @@ pub(crate) async fn run_pre(
     }
 }
 
-fn pre_command_input_json(request: &PreCompactRequest) -> Result<String, serde_json::Error> {
+fn pre_command_input(request: &PreCompactRequest) -> Result<Value, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
-    serde_json::to_string(&PreCompactCommandInput {
+    serde_json::to_value(PreCompactCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
         agent_id: subagent.agent_id,
@@ -167,17 +170,19 @@ pub(crate) async fn run_post(
         };
     }
 
-    let input_json = match post_command_input_json(&request) {
-        Ok(input_json) => input_json,
+    let input = match post_command_input(&request) {
+        Ok(input) => input,
         Err(error) => {
+            let hook_events = common::serialization_failure_hook_events(
+                matched,
+                Some(request.turn_id),
+                format!("failed to serialize post compact hook input: {error}"),
+            );
+            let stop_reason = common::failure_block_reason(&hook_events);
             return StatelessHookOutcome {
-                hook_events: common::serialization_failure_hook_events(
-                    matched,
-                    Some(request.turn_id),
-                    format!("failed to serialize post compact hook input: {error}"),
-                ),
-                should_stop: false,
-                stop_reason: None,
+                hook_events,
+                should_stop: stop_reason.is_some(),
+                stop_reason,
             };
         }
     };
@@ -185,7 +190,7 @@ pub(crate) async fn run_post(
     let results = dispatcher::execute_handlers(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_post_completed,
@@ -202,9 +207,9 @@ pub(crate) async fn run_post(
     }
 }
 
-fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde_json::Error> {
+fn post_command_input(request: &PostCompactRequest) -> Result<Value, serde_json::Error> {
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
-    serde_json::to_string(&PostCompactCommandInput {
+    serde_json::to_value(PostCompactCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
         agent_id: subagent.agent_id,
@@ -328,6 +333,11 @@ fn parse_completed(
         },
     }
 
+    if let Some(reason) = common::apply_failure_policy(handler, &mut status, &mut entries) {
+        should_stop = true;
+        stop_reason = Some(reason);
+    }
+
     dispatcher::ParsedHandler {
         completed: HookCompletedEvent {
             turn_id,
@@ -355,17 +365,15 @@ mod tests {
 
     use super::parse_post_completed;
     use super::parse_pre_completed;
-    use super::post_command_input_json;
-    use super::pre_command_input_json;
+    use super::post_command_input;
+    use super::pre_command_input;
     use crate::engine::ConfiguredHandler;
     use crate::engine::HandlerRunResult;
 
     #[test]
     fn pre_compact_input_includes_lifecycle_metadata() {
         let request = pre_request();
-        let input_json = pre_command_input_json(&request).expect("serialize command input");
-        let input: serde_json::Value =
-            serde_json::from_str(&input_json).expect("parse command input");
+        let input = pre_command_input(&request).expect("serialize command input");
 
         assert_eq!(
             input,
@@ -384,9 +392,7 @@ mod tests {
     #[test]
     fn post_compact_input_includes_lifecycle_metadata() {
         let request = post_request();
-        let input_json = post_command_input_json(&request).expect("serialize command input");
-        let input: serde_json::Value =
-            serde_json::from_str(&input_json).expect("parse command input");
+        let input = post_command_input(&request).expect("serialize command input");
 
         assert_eq!(
             input,
@@ -524,10 +530,12 @@ mod tests {
     fn handler(event_name: HookEventName) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name,
             matcher: None,
             timeout_sec: 5,
             status_message: Some("running compact hook".to_string()),
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
@@ -542,6 +550,8 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            structured_content: None,
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1_700_000_000,
             completed_at: 1_700_000_001,
             duration_ms: 12,

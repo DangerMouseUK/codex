@@ -26,6 +26,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
@@ -33,6 +34,10 @@ use futures::future::BoxFuture;
 use std::collections::HashSet;
 
 impl AgentControl for LocalAgentControl {
+    fn native_rollout_budget(&self) -> Option<std::sync::Arc<crate::RolloutBudget>> {
+        Some(std::sync::Arc::clone(&self.runtime.rollout_budget))
+    }
+
     fn identity(&self) -> SessionId {
         self.session_id()
     }
@@ -69,7 +74,11 @@ impl AgentControl for LocalAgentControl {
             } = request;
             let input = match input {
                 AgentInput::UserInput(input) => SpawnInitialInput::UserInput(input),
-                AgentInput::Message { message, mode } => {
+                AgentInput::Message {
+                    message,
+                    mode,
+                    source_tool_call_id,
+                } => {
                     if mode != MessageDeliveryMode::TriggerTurn {
                         return Err(CodexErr::InvalidRequest(
                             "spawn input must start the child turn".to_string(),
@@ -89,7 +98,11 @@ impl AgentControl for LocalAgentControl {
                         })?;
                     SpawnInitialInput::InterAgentCommunication(
                         message.into_communication(author, recipient, mode),
-                        AgentCommunicationContext::new(AgentCommunicationKind::Spawn, caller),
+                        AgentCommunicationContext {
+                            kind: AgentCommunicationKind::Spawn,
+                            sender_thread_id: caller,
+                            source_tool_call_id,
+                        },
                     )
                 }
             };
@@ -110,14 +123,20 @@ impl AgentControl for LocalAgentControl {
             let (metadata, submission_id) = match input {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
-                    if receiver.is_some() {
+                    let _residency_pin = if receiver.is_some() {
                         self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?;
-                    }
+                            .await?
+                    } else {
+                        None
+                    };
                     let submission_id = self.send_input(target, input, start_options).await?;
                     (receiver.unwrap_or_default(), submission_id)
                 }
-                AgentInput::Message { message, mode } => {
+                AgentInput::Message {
+                    message,
+                    mode,
+                    source_tool_call_id,
+                } => {
                     let receiver = self.runtime.ensure_agent_known(target)?;
                     let author = self
                         .runtime
@@ -140,13 +159,15 @@ impl AgentControl for LocalAgentControl {
                     // locally evicted recipients can retain mail without reloading.
                     // Loaded recipients go straight to delivery, which rejects sends
                     // racing an in-progress eviction when it acquires the residency pin.
-                    if mode == MessageDeliveryMode::TriggerTurn
+                    let _residency_pin = if mode == MessageDeliveryMode::TriggerTurn
                         || (self.runtime.upgrade()?.get_thread(target).await.is_err()
                             && self.runtime.registry.evicted_environments(target).is_none())
                     {
                         self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?;
-                    }
+                            .await?
+                    } else {
+                        None
+                    };
                     let communication = message.into_communication(author, receiver_path, mode);
                     let kind = match mode {
                         MessageDeliveryMode::QueueOnly => {
@@ -159,7 +180,11 @@ impl AgentControl for LocalAgentControl {
                         .send_inter_agent_communication(
                             target,
                             communication,
-                            AgentCommunicationContext::new(kind, caller),
+                            AgentCommunicationContext {
+                                kind,
+                                sender_thread_id: caller,
+                                source_tool_call_id,
+                            },
                             start_options,
                         )
                         .await?;
@@ -174,11 +199,8 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
-    fn take_mailbox(
-        &self,
-        agent: ThreadId,
-    ) -> Vec<codex_protocol::protocol::InterAgentCommunication> {
-        self.runtime.mailboxes.take(agent)
+    fn take_mailbox(&self, agent: ThreadId) -> Vec<crate::PendingAgentMessage> {
+        self.runtime.mailboxes.take(agent, |_| true)
     }
 
     fn watch_mailbox(&self, agent: ThreadId) -> tokio::sync::watch::Receiver<bool> {
@@ -191,6 +213,7 @@ impl AgentControl for LocalAgentControl {
             let config = parent.session.get_config().await.as_ref().clone();
             self.ensure_v2_agent_loaded(config, child, Some(parent))
                 .await
+                .map(drop)
         })
     }
 
@@ -205,7 +228,7 @@ impl AgentControl for LocalAgentControl {
             match version {
                 MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
                     let snapshot = self.inspect_agent(target).await?;
-                    self.interrupt_agent(target).await?;
+                    self.interrupt_agent(target, Op::Interrupt).await?;
                     Ok(snapshot)
                 }
                 MultiAgentVersion::V2 => self.interrupt_spawned_agent(caller, target).await,
@@ -280,8 +303,12 @@ impl AgentControl for LocalAgentControl {
         self.execution_guard(version, source)
     }
 
-    fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.record_rollout_budget_usage(&usage) })
+    fn record_usage(
+        &self,
+        usage: Option<TokenUsage>,
+        hook_units: f64,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.record_rollout_budget_usage(usage.as_ref(), hook_units) })
     }
 
     fn turn_finished<'a>(
