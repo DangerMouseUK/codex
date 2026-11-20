@@ -1,6 +1,7 @@
 //! Owns scheduled and manual installs, daemon restarts, and updater replacement.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command as StdCommand;
@@ -79,13 +80,15 @@ pub(crate) async fn run(
     http_client_factory: HttpClientFactory,
     restore_release: Option<String>,
 ) -> Result<()> {
+    let daemon = Daemon::from_environment()?;
+    crate::backend::stderr_log::start(daemon.update_pid_file.with_extension("stderr.log"));
     let http = RouteAwareClientPool::new_without_request_logging(
         http_client_factory,
         ClientRouteClass::Other,
     );
     run_with_http(
         &http,
-        &Daemon::from_environment()?,
+        &daemon,
         &current_updater_identity().await?,
         restore_release,
     )
@@ -130,10 +133,17 @@ async fn run_with_http(
             .context("updater socket has no parent")?,
     )
     .await?;
-    if socket_path.exists() {
-        tokio::fs::remove_file(&socket_path).await?;
-    }
-    let mut listener = Some(codex_uds::UnixListener::bind(&socket_path).await?);
+    #[cfg(unix)]
+    let (listener, _socket_guard) =
+        codex_app_server_transport::bind_private_daemon_socket(&socket_path).await?;
+    #[cfg(windows)]
+    let listener = {
+        if socket_path.exists() {
+            tokio::fs::remove_file(&socket_path).await?;
+        }
+        codex_uds::UnixListener::bind(&socket_path).await?
+    };
+    let mut listener = Some(listener);
     #[cfg(windows)]
     updater.mark_ready().await?;
     let needs_managed_handoff =
@@ -188,6 +198,15 @@ async fn run_with_http(
                 if restore_release.is_some() {
                     return Ok(());
                 }
+                match crate::update_policy::allowed(daemon).await {
+                    Ok(false) => return Ok(()),
+                    Err(_) => {
+                        daemon.diagnostic(format_args!("warning: daemon update policy is unavailable; retrying"));
+                        next_check = Instant::now() + Duration::from_secs(60);
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
                 match UpdaterSettings::load(&daemon.settings_file).await {
                     Ok(settings) if !settings.auto_update_enabled => return Ok(()),
                     Err(_) => {
@@ -221,7 +240,7 @@ async fn run_with_http(
                             if listener.is_none() {
                                 return Err(err);
                             }
-                            eprintln!("warning: failed to refresh managed updater: {err:#}");
+                            let _ = crate::stderr_writer().write_all(format!("warning: failed to refresh managed updater: {err:#}\n").as_bytes());
                             next_check = Instant::now() + Duration::from_secs(30);
                         }
                     }
@@ -328,6 +347,7 @@ async fn update_once(
     terminate: &mut Signal,
     trigger: UpdateTrigger<'_>,
 ) -> Result<(UpdateLoopControl, Option<RestartIfRunningOutcome>)> {
+    crate::update_policy::ensure_allowed(daemon).await?;
     if trigger == UpdateTrigger::Scheduled
         && !UpdaterSettings::load(&daemon.settings_file)
             .await?
@@ -394,6 +414,7 @@ async fn update_once(
         crate::managed_install::package_root(codex_home) == package_root,
         "daemon package root changed during the update; retry the command"
     );
+    crate::update_policy::ensure_allowed(daemon).await?;
     let started = std::time::Instant::now();
     #[cfg(unix)]
     if matches!(
@@ -446,7 +467,7 @@ async fn update_once(
             return Ok((UpdateLoopControl::Stop, None));
         }
         match daemon
-            .try_restart_if_running(restart_mode, &managed_codex_bin)
+            .try_restart_if_running(restart_mode, &managed_codex_bin, &package_root)
             .await?
         {
             RestartIfRunningOutcome::Busy => {

@@ -37,7 +37,7 @@ pub struct UserPromptSubmitOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_stop: bool,
     pub stop_reason: Option<String>,
-    pub additional_contexts: Vec<String>,
+    pub additional_contexts: Vec<crate::HookContext>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub(crate) async fn run(
     }
 
     let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
-    let input_json = match serde_json::to_string(&UserPromptSubmitCommandInput {
+    let input = match serde_json::to_value(UserPromptSubmitCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
         agent_id: subagent.agent_id,
@@ -92,7 +92,7 @@ pub(crate) async fn run(
         permission_mode: request.permission_mode.clone(),
         prompt: request.prompt.clone(),
     }) {
-        Ok(input_json) => input_json,
+        Ok(input) => input,
         Err(error) => {
             return serialization_failure_outcome(common::serialization_failure_hook_events(
                 matched,
@@ -105,7 +105,7 @@ pub(crate) async fn run(
     let results = dispatcher::execute_handlers(
         engine,
         matched,
-        input_json,
+        &input,
         request.cwd.as_path(),
         Some(request.turn_id),
         parse_completed,
@@ -176,6 +176,7 @@ fn parse_completed(
                             &mut additional_contexts_for_model,
                             handler,
                             additional_context,
+                            &run_result.context_metadata,
                         );
                     }
                     let _ = parsed.universal.suppress_output;
@@ -221,6 +222,7 @@ fn parse_completed(
                         &mut additional_contexts_for_model,
                         handler,
                         additional_context,
+                        &run_result.context_metadata,
                     );
                 }
             }
@@ -258,6 +260,11 @@ fn parse_completed(
         },
     }
 
+    if let Some(reason) = common::apply_failure_policy(handler, &mut status, &mut entries) {
+        should_stop = true;
+        stop_reason = Some(reason);
+    }
+
     let completed = HookCompletedEvent {
         turn_id,
         run: dispatcher::completed_summary(handler, &run_result, status, entries),
@@ -275,10 +282,11 @@ fn parse_completed(
 }
 
 fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> UserPromptSubmitOutcome {
+    let stop_reason = common::failure_block_reason(&hook_events);
     UserPromptSubmitOutcome {
         hook_events,
-        should_stop: false,
-        stop_reason: None,
+        should_stop: stop_reason.is_some(),
+        stop_reason,
         additional_contexts: Vec::new(),
     }
 }
@@ -317,7 +325,7 @@ mod tests {
                 should_stop: true,
                 stop_reason: Some("pause".to_string()),
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "do not inject".to_string(),
+                    context: crate::HookContext::harness("do not inject".to_string()),
                     limit: Default::default(),
                 }],
             }
@@ -356,7 +364,7 @@ mod tests {
                 should_stop: true,
                 stop_reason: Some("slow down".to_string()),
                 additional_contexts_for_model: vec![AdditionalContext {
-                    text: "do not inject".to_string(),
+                    context: crate::HookContext::harness("do not inject".to_string()),
                     limit: Default::default(),
                 }],
             }
@@ -462,10 +470,12 @@ mod tests {
     fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
             builtin: false,
+            plugin_trust: None,
             event_name: HookEventName::UserPromptSubmit,
             matcher: None,
             timeout_sec: 5,
             status_message: None,
+            on_failure: Default::default(),
             additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs().into(),
             source: codex_protocol::protocol::HookSource::User,
@@ -480,6 +490,8 @@ mod tests {
 
     fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
         HandlerRunResult {
+            structured_content: None,
+            context_metadata: codex_protocol::models::ContentItemMetadata::harness(),
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

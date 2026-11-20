@@ -19,10 +19,13 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
+use tokio::time::Instant;
+use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +36,10 @@ use super::ExecServerError;
 use super::Inner;
 use super::LazyRemoteExecServerClient;
 use super::fail_all_in_flight_work;
+use super::is_retryable_registry_error;
+use super::is_transport_closed_error;
+use super::registry_recovery_retry_delay;
+use crate::ConnectionAttemptOutcome;
 use crate::EnvironmentConnectionState;
 use crate::NoiseChannelPublicKey;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
@@ -41,6 +48,8 @@ use crate::client_api::NoiseRendezvousConnectBundle;
 use crate::client_api::NoiseRendezvousConnectProvider;
 use crate::client_transport::ExecServerReconnectStrategy;
 
+const STARTUP_TRANSPORT_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Shared startup/reconnect result plus cancellation for work superseded by refresh.
 /// The optional transport carries a refresh lookup's bundle into the normal connector.
 #[derive(Default)]
@@ -48,6 +57,20 @@ pub(super) struct ConnectionAttempt {
     pub(super) result: OnceCell<ConnectionResult>,
     pub(super) cancelled: CancellationToken,
     pub(super) transport: Option<ExecServerTransportParams>,
+}
+
+struct ConnectionObservation<'a> {
+    started: Option<Instant>,
+    outcome: ConnectionAttemptOutcome,
+    observer: Option<&'a super::ConnectionObserver>,
+}
+
+impl Drop for ConnectionObservation<'_> {
+    fn drop(&mut self) {
+        if let (Some(started), Some(observer)) = (self.started, self.observer) {
+            observer(started.elapsed(), self.outcome);
+        }
+    }
 }
 
 // Use the compared bundle intact for the first connection: address, key and authorization
@@ -185,7 +208,7 @@ impl LazyRemoteExecServerClient {
                 }
                 let result = attempt
                     .result
-                    .get_or_init(|| self.connect_once(&attempt))
+                    .get_or_init(|| self.connect_with_retry(&attempt))
                     .await
                     .clone();
                 let mut reconnect = self
@@ -208,10 +231,46 @@ impl LazyRemoteExecServerClient {
         client.environment_status().await.map(drop)
     }
 
-    #[tracing::instrument(name = "codex.exec_server.remote.connect", skip_all)]
-    pub(super) fn connect_once<'a>(
+    /// Run one shared setup operation. Registry failures have their own bounded retry policy;
+    /// only transient transport or initialization failures admit another physical attempt.
+    pub(super) fn connect_with_retry<'a>(
         &'a self,
         attempt: &'a ConnectionAttempt,
+    ) -> BoxFuture<'a, ConnectionResult> {
+        Box::pin(async move {
+            let mut provisioning_deadline = None;
+            let mut result = self.connect_once(attempt, &mut provisioning_deadline).await;
+            if !self.can_reconnect() || !retry_startup_transport(&result) {
+                return result;
+            }
+            let deadline = Instant::now() + STARTUP_TRANSPORT_RETRY_TIMEOUT;
+            let retry_key = uuid::Uuid::new_v4().to_string();
+            let mut retry = 0;
+            loop {
+                let delay = registry_recovery_retry_delay(&retry_key, retry);
+                retry = retry.saturating_add(1);
+                tokio::select! {
+                    biased;
+                    _ = attempt.cancelled.cancelled() => return Err(Arc::new(ExecServerError::Disconnected("connection attempt was superseded".to_string()))),
+                    _ = sleep(delay.min(deadline.saturating_duration_since(Instant::now()))) => {},
+                }
+                if Instant::now() >= deadline {
+                    return result;
+                }
+                // Bound retry admission, not the duration of a registry or transport phase.
+                result = self.connect_once(attempt, &mut provisioning_deadline).await;
+                if !retry_startup_transport(&result) {
+                    return result;
+                }
+            }
+        })
+    }
+
+    #[tracing::instrument(name = "codex.exec_server.remote.connect", skip_all)]
+    fn connect_once<'a>(
+        &'a self,
+        attempt: &'a ConnectionAttempt,
+        provisioning_deadline: &'a mut Option<Instant>,
     ) -> BoxFuture<'a, ConnectionResult> {
         // Keep the transport future out of every caller's async layout, including
         // the CLI entry point, which otherwise exceeds rustc's query-depth limit.
@@ -225,11 +284,22 @@ impl LazyRemoteExecServerClient {
                         "missing transport params for lazy exec-server connection".to_string(),
                     ))
                 })?;
-            let client = tokio::select! {
+            let mut observation = ConnectionObservation {
+                started: None,
+                outcome: ConnectionAttemptOutcome::Cancelled,
+                observer: (self.cached_client().is_none() && attempt.transport.is_none())
+                    .then(|| self.connection_observer.get())
+                    .flatten(),
+            };
+            let result = tokio::select! {
                 biased;
                 _ = attempt.cancelled.cancelled() => return Err(Arc::new(ExecServerError::Disconnected("connection attempt was superseded".to_string()))),
-                result = ExecServerClient::connect_for_transport(transport.clone(), self.http_client_factory.clone()) => result.map_err(Arc::new)?,
+                result = ExecServerClient::connect_for_transport(transport.clone(), self.http_client_factory.clone(), &mut observation.started, provisioning_deadline) => result,
             };
+            let client = result.map_err(|error| {
+                observation.outcome = ConnectionAttemptOutcome::Failure;
+                Arc::new(error)
+            })?;
             // Cancellation can race with a completed handshake. Recheck before attaching
             // state or installing the client, under the same lock used by refresh.
             {
@@ -242,6 +312,7 @@ impl LazyRemoteExecServerClient {
                         self.environment_connection_state_tx.clone(),
                     );
                     *current = Some(client.clone());
+                    observation.outcome = ConnectionAttemptOutcome::Success;
                     return Ok(client);
                 }
             }
@@ -251,6 +322,13 @@ impl LazyRemoteExecServerClient {
             )))
         })
     }
+}
+
+fn retry_startup_transport(result: &ConnectionResult) -> bool {
+    result.as_ref().is_err_and(|error| {
+        !is_retryable_registry_error(error)
+            && (error.is_retryable_preparation_error() || is_transport_closed_error(error))
+    })
 }
 
 impl Inner {

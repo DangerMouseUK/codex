@@ -36,7 +36,7 @@ use ratatui::crossterm::execute;
 const MAX_TERMINAL_TITLE_CHARS: usize = 240;
 
 #[derive(Clone, Copy)]
-enum TitleEncoding {
+pub(crate) enum TitleEncoding {
     Unicode,
     Screen,
 }
@@ -126,7 +126,7 @@ impl Command for SetWindowTitle {
 /// This removes terminal control characters, strips invisible/bidi formatting
 /// characters, collapses any whitespace run into a single ASCII space, and
 /// truncates after [`MAX_TERMINAL_TITLE_CHARS`] emitted characters.
-fn sanitize_terminal_title(title: &str, encoding: TitleEncoding) -> String {
+pub(crate) fn sanitize_terminal_title(title: &str, encoding: TitleEncoding) -> String {
     let mut sanitized = String::new();
     let mut chars_written = 0;
     let mut pending_space = false;
@@ -139,7 +139,11 @@ fn sanitize_terminal_title(title: &str, encoding: TitleEncoding) -> String {
             continue;
         }
 
-        if is_disallowed_terminal_title_char(ch) {
+        let is_cloud_emoji_selector = matches!(encoding, TitleEncoding::Unicode)
+            && ch == '\u{FE0F}'
+            && !pending_space
+            && sanitized.ends_with('☁');
+        if is_disallowed_terminal_title_char(ch) && !is_cloud_emoji_selector {
             continue;
         }
 
@@ -260,7 +264,7 @@ mod tests {
 
     #[test]
     fn screen_title_stays_ascii_across_activity_and_user_named_fields() {
-        let title = " ● ⠇ | ě[31m thread \u{202e}\x07| 日本語 ćafé  ";
+        let title = " ☁️ ● ⠇ | ě[31m thread \u{202e}\x07| 日本語 ćafé  ";
         let screen = sanitize_terminal_title(title, TitleEncoding::Screen);
         let unicode = sanitize_terminal_title(title, TitleEncoding::Unicode);
 
@@ -268,8 +272,8 @@ mod tests {
         insta::assert_snapshot!(
             format!("Screen: {screen}\nDirect: {unicode}"),
             @r#"
-        Screen: * | | ?[31m thread | ??? ?af?
-        Direct: ● ⠇ | ě[31m thread | 日本語 ćafé
+        Screen: ? * | | ?[31m thread | ??? ?af?
+        Direct: ☁️ ● ⠇ | ě[31m thread | 日本語 ćafé
         "#
         );
         assert_eq!(

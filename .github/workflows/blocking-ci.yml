@@ -12,9 +12,23 @@ jobs:
   # version-controlled list that the main-branch ruleset should require.
   bazel:
     if: github.repository == 'openai/codex'
+    permissions:
+      contents: read
+      id-token: write
     name: Bazel
     uses: ./.github/workflows/bazel.yml
     secrets: inherit
+
+  bazel-result:
+    name: Bazel result
+    needs: bazel
+    if: ${{ github.repository == 'openai/codex' && (always()) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the Bazel workflow to succeed
+        env:
+          BAZEL_RESULT: ${{ needs.bazel.result }}
+        run: test "$BAZEL_RESULT" = success
 
   blob-size-policy:
     if: github.repository == 'openai/codex'
@@ -42,12 +56,18 @@ jobs:
 
   rust-ci:
     if: github.repository == 'openai/codex'
+    permissions:
+      contents: read
+      id-token: write
     name: rust-ci
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit
 
   sdk:
     if: github.repository == 'openai/codex'
+    permissions:
+      contents: read
+      id-token: write
     name: sdk
     uses: ./.github/workflows/sdk.yml
     secrets: inherit
@@ -58,7 +78,6 @@ jobs:
     # required check can appear successful instead of reporting the failure.
     if: ${{ github.repository == 'openai/codex' && (always()) }}
     needs:
-      - bazel
       - blob-size-policy
       - cargo-deny
       - codespell

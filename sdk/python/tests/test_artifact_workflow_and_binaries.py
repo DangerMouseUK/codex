@@ -115,26 +115,18 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     )
     actual = {
         "working_directory": lines[0],
-        "fmt_comment": next(line for line in reversed(lines[:fmt_index]) if line.startswith("#")),
         "fmt_commands": [
             line.strip()
             for line in lines[fmt_index + 1 : fmt_check_index]
             if line.strip() and not line.startswith("#")
         ],
-        "fmt_check_comment": next(
-            line for line in reversed(lines[:fmt_check_index]) if line.startswith("#")
-        ),
         "fmt_check_commands": [
             line.strip() for line in lines[fmt_check_index + 1 : next_recipe_index] if line.strip()
         ],
     }
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
-        "fmt_comment": (
-            "# Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts."
-        ),
         "fmt_commands": ["@{{ python }} ../scripts/format.py"],
-        "fmt_check_comment": "# Check formatting without modifying files.",
         "fmt_check_commands": ["@{{ python }} ../scripts/format.py --check"],
     }
 
@@ -152,6 +144,14 @@ def test_root_format_driver_covers_all_formatter_groups(
 ) -> None:
     """The shared driver should retain every formatter in both modes."""
     script = _load_root_format_script_module()
+    for name in (
+        "bazel/rules/example.rs",
+        "codex-rs/src/lib.rs",
+        "codex-rs/new file.rs",
+    ):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
     git_ls_files_args = [
         "git",
         "ls-files",
@@ -164,6 +164,11 @@ def test_root_format_driver_covers_all_formatter_groups(
     # The Python SDK CI image has no Git; keep discovery mocked at the process boundary.
     def fake_check_output(args, *, cwd):
         assert cwd == tmp_path
+        if args == git_ls_files_args + ["--", "*.rs"]:
+            return (
+                b"codex-rs/src/lib.rs\0bazel/rules/example.rs\0"
+                b"codex-rs/new file.rs\0codex-rs/deleted.rs\0"
+            )
         assert args == git_ls_files_args
         return b"MODULE.bazel\0README.md\0third_party/v8/libcxx.BUILD.bazel\0"
 
@@ -185,18 +190,16 @@ def test_root_format_driver_covers_all_formatter_groups(
         len(group.commands) for group in formatters
     ]
     sdk_uv_run_args = (
-        "uv",
-        "run",
-        "--frozen",
+        sys.executable,
+        "codex-rs/scripts/run_locked_python_tool.py",
         "--project",
         "sdk/python",
         "--only-group",
         "format",
     )
     scripts_uv_run_args = (
-        "uv",
-        "run",
-        "--frozen",
+        sys.executable,
+        "codex-rs/scripts/run_locked_python_tool.py",
         "--project",
         "scripts",
     )
@@ -225,11 +228,26 @@ def test_root_format_driver_covers_all_formatter_groups(
     )
     assert formatters[0].commands[-1].args == ("just", "--unstable", "--fmt")
     assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
-    cargo_fmt_args = ("cargo", "fmt", "--", "--config", "imports_granularity=Item")
-    assert formatters[1].commands[0].args == cargo_fmt_args
-    assert formatters[1].commands[0].cwd == tmp_path / "codex-rs"
-    assert checks[1].commands[0].args == cargo_fmt_args + ("--check",)
-    assert checks[1].commands[0].cwd == tmp_path / "codex-rs"
+    rustfmt_args = (
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--config-path",
+        str(tmp_path / "codex-rs/rustfmt.toml"),
+        "--config",
+        "imports_granularity=Item,skip_children=true",
+    )
+    rust_files = (
+        os.path.join("..", "bazel", "rules", "example.rs"),
+        "new file.rs",
+        os.path.join("src", "lib.rs"),
+    )
+    assert formatters[1].commands == (
+        script.Command(rustfmt_args + rust_files, tmp_path / "codex-rs"),
+    )
+    assert checks[1].commands == (
+        script.Command(rustfmt_args + ("--check",) + rust_files, tmp_path / "codex-rs"),
+    )
     format_buildifier_args = formatters[2].commands[-1].args
     check_buildifier_args = checks[2].commands[-1].args
     assert format_buildifier_args[:4] == (
@@ -480,13 +498,12 @@ def test_python_codegen_schema_annotation_adds_stable_variant_titles() -> None:
         "GranularAskForApproval",
     ]
 
-    reasoning_summary_titles = [
-        variant.get("title") for variant in definitions["ReasoningSummary"]["oneOf"]
-    ]
-    assert reasoning_summary_titles == [
-        "ReasoningSummaryValue",
-        "NoneReasoningSummary",
-    ]
+    from openai_codex.generated.v2_all import ReasoningSummary
+
+    reasoning_values, disabled = definitions["ReasoningSummary"]["oneOf"]
+    assert reasoning_values["title"] == "ReasoningSummaryValue"
+    assert disabled["enum"] == ["none"]
+    assert ReasoningSummary.model_validate("none").root == "none"
 
 
 def test_generate_v2_all_uses_titles_for_generated_names() -> None:
@@ -534,6 +551,54 @@ def test_generated_inline_image_class_names_remain_stable() -> None:
         InputImageFunctionCallOutputContentItem.__name__
         == "InputImageFunctionCallOutputContentItem"
     )
+
+
+def test_generated_audio_inputs_preserve_inline_and_file_shapes() -> None:
+    """Existing audio imports still work, and file references round-trip through the unions."""
+    from openai_codex.generated.v2_all import (
+        AudioUserInput,
+        ContentItem,
+        FileIdUserInput1,
+        InputAudioContentItem,
+        InputAudioFunctionCallOutputContentItem,
+        UserInput,
+    )
+
+    audio_url = "data:audio/wav;base64,YXVkaW8="
+    for model, wire in [
+        (InputAudioFunctionCallOutputContentItem, {"type": "input_audio", "audio_url": audio_url}),
+        (AudioUserInput, {"type": "audio", "url": audio_url}),
+        (InputAudioContentItem, {"type": "input_audio", "audio_url": audio_url}),
+        (UserInput, {"type": "audio", "fileId": "file_audio"}),
+        (FileIdUserInput1, {"type": "audio", "fileId": "file_audio"}),
+        (ContentItem, {"type": "input_audio", "file_id": "file_audio"}),
+    ]:
+        audio = model.model_validate(wire)
+        assert audio.model_dump(by_alias=True, exclude_unset=True, mode="json") == wire
+
+
+def test_generated_image_generation_thread_item_alias_remains_available() -> None:
+    """Existing SDK callers can still construct and validate inline image-generation items."""
+    from openai_codex.generated.v2_all import (
+        ImageGenerationThreadItem,
+        ResultThreadItem,
+    )
+
+    item = ImageGenerationThreadItem.model_validate(
+        {
+            "failure": None,
+            "id": "image_1",
+            "result": "aW1hZ2U=",
+            "revisedPrompt": None,
+            "savedPath": None,
+            "status": "completed",
+            "transparentBackground": None,
+            "type": "imageGeneration",
+        }
+    )
+
+    assert ImageGenerationThreadItem is ResultThreadItem
+    assert isinstance(item, ResultThreadItem)
 
 
 def test_runtime_package_template_has_no_checked_in_binaries() -> None:

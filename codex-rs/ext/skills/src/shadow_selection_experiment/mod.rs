@@ -85,8 +85,8 @@ impl ShadowSelectionExperiment {
         recent_skill_invocations: Arc<RecentSkillInvocations>,
         task_context: Arc<ShadowTaskContext>,
     ) -> ShadowSelectionTurnState {
-        let query = build_shadow_query(&input.user_input);
-        let task_snapshot = task_context.begin_turn(&input.turn_id, &query, &input.user_input);
+        let query = build_shadow_query(input.user_input);
+        let task_snapshot = task_context.begin_turn(&input.turn_id, &query, input.user_input);
         let recent_skill_resources = recent_skill_invocations.snapshot();
         let explicitly_selected_skill_resources = explicitly_selected
             .iter()
@@ -95,7 +95,7 @@ impl ShadowSelectionExperiment {
         let mut eligible_ids = HashSet::new();
         let mut eligible_skill_resources = HashSet::new();
         for (id, entry) in catalog.entries.iter().enumerate() {
-            // Invocation observation exists only for host shell use and cloud reads.
+            // Invocation observation covers host shell use and reads of Cloud-primary skills.
             if !entry.is_model_visible()
                 || !matches!(
                     &entry.authority.kind,

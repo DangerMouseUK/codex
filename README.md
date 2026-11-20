@@ -28,6 +28,8 @@ An independent fork of [OpenAI's Codex CLI](https://github.com/openai/codex) foc
 
 The [first full-workspace run after our upstream sync](https://github.com/DangerMouseUK/codex/actions/runs/37668380554) failed during native compilation: macOS could not locate GStreamer, Linux could not locate GLib, and Windows could not run the required pkg-config probe for GLib. Passing focused checks does not establish full-workspace compatibility. These dependency gaps are tracked in M1.
 
+The 20 November 2026 upstream sync includes PowerShell working-directory and quoting fixes, Windows MCP improvements, and cross-platform path corrections. See the [upstream review in the roadmap](./docs/windows-native-roadmap.md) for the specific changes and remaining gaps. Fork CI now uses upstream's native voice dependency actions for full workspace checks; M1 remains open until validation completes.
+
 ## Windows development quickstart
 
 This fork currently has no published binary releases. The steps below set up a source checkout for development. You need Git and WinGet available; setup can start from Windows PowerShell 5.1.

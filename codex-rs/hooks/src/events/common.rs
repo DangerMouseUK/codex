@@ -1,20 +1,31 @@
+use std::path::Path;
+
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use codex_utils_path_uri::PathUri;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::HandlerSourcePath;
 use crate::engine::dispatcher;
 use crate::output_spill::AdditionalContext;
+use codex_protocol::models::ContentItemMetadata;
 
 /// Identifies a thread-spawned subagent when a normal hook runs inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentHookContext {
     pub agent_id: String,
     pub agent_type: String,
+}
+
+pub(crate) fn command_input_cwd(cwd: &Path, tool_cwd: Option<&PathUri>) -> String {
+    tool_cwd.map_or_else(
+        || cwd.display().to_string(),
+        PathUri::inferred_native_path_string,
+    )
 }
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
@@ -39,13 +50,17 @@ pub(crate) fn append_additional_context(
     additional_contexts_for_model: &mut Vec<AdditionalContext>,
     handler: &ConfiguredHandler,
     additional_context: String,
+    metadata: &ContentItemMetadata,
 ) {
     entries.push(HookOutputEntry {
         kind: HookOutputEntryKind::Context,
         text: additional_context.clone(),
     });
     additional_contexts_for_model.push(AdditionalContext {
-        text: additional_context,
+        context: crate::HookContext {
+            text: additional_context,
+            metadata: metadata.clone(),
+        },
         limit: handler.additional_context_limit,
     });
 }
@@ -53,10 +68,34 @@ pub(crate) fn append_additional_context(
 pub(crate) fn flatten_additional_contexts<'a>(
     additional_contexts: impl IntoIterator<Item = &'a [AdditionalContext]>,
 ) -> Vec<AdditionalContext> {
-    additional_contexts
-        .into_iter()
-        .flat_map(|chunk| chunk.iter().cloned())
-        .collect()
+    additional_contexts.into_iter().flatten().cloned().collect()
+}
+
+/// Preserve failure diagnostics while applying the handler's opt-in blocking policy.
+pub(crate) fn apply_failure_policy(
+    handler: &ConfiguredHandler,
+    status: &mut HookRunStatus,
+    entries: &mut Vec<HookOutputEntry>,
+) -> Option<String> {
+    if *status != HookRunStatus::Failed {
+        return None;
+    }
+    let reason = handler.failure_block_reason()?;
+    *status = HookRunStatus::Blocked;
+    entries.push(HookOutputEntry {
+        kind: HookOutputEntryKind::Feedback,
+        text: reason.clone(),
+    });
+    Some(reason)
+}
+
+pub(crate) fn failure_block_reason(hook_events: &[HookCompletedEvent]) -> Option<String> {
+    hook_events
+        .iter()
+        .filter(|event| event.run.status == HookRunStatus::Blocked)
+        .flat_map(|event| &event.run.entries)
+        .find(|entry| entry.kind == HookOutputEntryKind::Feedback)
+        .map(|entry| entry.text.clone())
 }
 
 pub(crate) fn serialization_failure_hook_events(
@@ -66,7 +105,12 @@ pub(crate) fn serialization_failure_hook_events(
 ) -> Vec<HookCompletedEvent> {
     handlers
         .into_iter()
-        .filter(|handler| matches!(handler.source_path, HandlerSourcePath::Local(_)))
+        .filter(|handler| {
+            !matches!(
+                handler.source_path,
+                HandlerSourcePath::ExecutorScoped { .. }
+            )
+        })
         .map(|handler| {
             let mut run = dispatcher::running_summary(&handler);
             run.status = HookRunStatus::Failed;
@@ -76,6 +120,7 @@ pub(crate) fn serialization_failure_hook_events(
                 kind: HookOutputEntryKind::Error,
                 text: error_message.clone(),
             }];
+            apply_failure_policy(&handler, &mut run.status, &mut run.entries);
             HookCompletedEvent {
                 turn_id: turn_id.clone(),
                 run,
@@ -123,7 +168,11 @@ pub(crate) fn matcher_pattern_for_event(
         | HookEventName::SubagentStop
         | HookEventName::PreCompact
         | HookEventName::PostCompact => matcher,
-        HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => None,
+        HookEventName::PreModelRequest
+        | HookEventName::PostModelRequest
+        | HookEventName::UserPromptSubmit
+        | HookEventName::Stop
+        | HookEventName::Interrupt => None,
     }
 }
 

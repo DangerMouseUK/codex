@@ -1,7 +1,6 @@
 //! Retains watched global locations and sandbox-scoped response snapshots.
-//! Replacement snapshots isolate in-flight loads; unavailable watchers force request-time reloads.
+//! Replacement snapshots isolate in-flight loads; failed watch registration forces request-time reloads.
 
-use crate::DiscoverV2CapabilitiesRequest;
 use crate::DiscoverV2CapabilitiesResponse;
 use crate::FileSystemSandboxContext;
 use crate::LocalFileSystem;
@@ -9,7 +8,9 @@ use crate::discover_v2::capability_discoveries::load_capability_discoveries;
 use crate::discover_v2::capability_locations::CapabilityLocationRequest;
 use crate::discover_v2::capability_locations::CapabilityLocations;
 use crate::discover_v2::capability_locations::prewarm_locations;
+use codex_config::loader::system_config_toml_file;
 use codex_file_watcher::WatchRegistration;
+use codex_utils_path_uri::PathUri;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -35,7 +36,7 @@ struct LocationState {
     dirty: AtomicBool,
     locations: CapabilityLocations,
     sandbox_discoveries: Mutex<Vec<Arc<CachedSandboxDiscovery>>>,
-    _registration: WatchRegistration,
+    registration: WatchRegistration,
 }
 
 struct CachedSandboxDiscovery {
@@ -54,57 +55,49 @@ impl CapabilityManager {
         })
     }
 
+    /// Resolves fixed paths on first initialization and reuses the prewarmed locations.
     pub(crate) async fn prewarm_locations(
         self: &Arc<Self>,
-        request: CapabilityLocationRequest,
     ) -> io::Result<&(CapabilityLocationRequest, CapabilityLocations)> {
         let cached = self
             .prewarmed_locations
             .get_or_try_init(|| async {
+                let request = CapabilityLocationRequest {
+                    codex_home: PathUri::from_abs_path(&codex_utils_home_dir::find_codex_home()?),
+                    user_home: dirs::home_dir()
+                        .and_then(|home| PathUri::from_host_native_path(home).ok()),
+                    system_skills_root: system_config_toml_file()?
+                        .parent()
+                        .map(|root| PathUri::from_abs_path(&root.join("skills"))),
+                };
                 let locations = prewarm_locations(&self.file_system, &request).await?;
-                Ok::<_, io::Error>((request.clone(), locations))
+                Ok::<_, io::Error>((request, locations))
             })
             .await?;
-        // Check the winning request even when another caller initialized the cell.
-        if cached.0 != request {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "capability home paths differ from the prewarmed configuration",
-            ));
-        }
         self.initialize_watchers(&cached.1).await;
         Ok(cached)
     }
 
     /// Reuses startup locations, retrying prewarming if the background scan failed.
-    pub(crate) async fn get_or_refresh_discovery(
+    pub(crate) async fn discover(
         self: &Arc<Self>,
-        location_request: CapabilityLocationRequest,
-        params: DiscoverV2CapabilitiesRequest,
+        sandbox: Option<FileSystemSandboxContext>,
+        force_reload: bool,
     ) -> io::Result<Arc<DiscoverV2CapabilitiesResponse>> {
-        let (location_request, _) = match self.prewarm_locations(location_request).await {
-            Ok(prewarmed) => prewarmed,
-            Err(error) => {
-                return Ok(Arc::new(DiscoverV2CapabilitiesResponse {
-                    warnings: vec![format!(
-                        "could not prewarm capability discovery: {:?}",
-                        error.kind()
-                    )],
-                    ..Default::default()
-                }));
-            }
-        };
-        let location_state = self.get_or_refresh_locations(location_request).await?;
+        let (location_request, _) = self.prewarm_locations().await?;
+        let location_state = self
+            .get_or_refresh_locations(location_request, force_reload)
+            .await?;
         let discovery = {
             let mut discoveries = location_state.sandbox_discoveries.lock().await;
             if let Some(discovery) = discoveries
                 .iter()
-                .find(|discovery| discovery.sandbox == params.sandbox)
+                .find(|discovery| discovery.sandbox == sandbox)
             {
                 Arc::clone(discovery)
             } else {
                 let discovery = Arc::new(CachedSandboxDiscovery {
-                    sandbox: params.sandbox,
+                    sandbox,
                     response: OnceCell::new(),
                 });
                 if discoveries.len() == MAX_CACHED_SANDBOX_CONTEXTS {
@@ -115,7 +108,7 @@ impl CapabilityManager {
                 discovery
             }
         };
-        if self.watchers.has_subscription() {
+        if location_state.registration.registration_succeeded() {
             return discovery
                 .response
                 .get_or_try_init(|| {
@@ -139,9 +132,11 @@ impl CapabilityManager {
     async fn get_or_refresh_locations(
         &self,
         request: &CapabilityLocationRequest,
+        force_reload: bool,
     ) -> io::Result<Arc<LocationState>> {
-        if self.watchers.has_subscription()
+        if !force_reload
             && let Some(location_state) = self.location_snapshot().await
+            && location_state.registration.registration_succeeded()
             && !location_state.dirty.load(Ordering::Relaxed)
         {
             return Ok(location_state);
@@ -151,17 +146,18 @@ impl CapabilityManager {
             .acquire()
             .await
             .map_err(io::Error::other)?;
-        if self.watchers.has_subscription()
+        if !force_reload
             && let Some(location_state) = self.location_snapshot().await
+            && location_state.registration.registration_succeeded()
             && !location_state.dirty.load(Ordering::Relaxed)
         {
             return Ok(location_state);
         }
-        // Retry dirty locations; without a subscription, reload on every request.
+        // Retry dirty locations; failed watch registration reloads on every request.
         let locations = match prewarm_locations(&self.file_system, request).await {
             Ok(locations) => locations,
             Err(error) => {
-                if let Some(location_state) = self.location_snapshot().await {
+                if !force_reload && let Some(location_state) = self.location_snapshot().await {
                     tracing::warn!(error_kind = ?error.kind(), "capability refresh failed; retrying on the next request");
                     return Ok(location_state);
                 }
@@ -170,7 +166,7 @@ impl CapabilityManager {
         };
         let next = Arc::new(LocationState {
             dirty: AtomicBool::new(false),
-            _registration: self.watchers.register_paths(&locations),
+            registration: self.watchers.register_paths(&locations),
             locations,
             sandbox_discoveries: Mutex::default(),
         });

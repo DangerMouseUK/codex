@@ -1,4 +1,4 @@
-//! Low-cardinality metrics for Guardian V2 classification, connections, and approval decisions.
+//! Structured failure diagnostics and low-cardinality metrics for Guardian V2 scoring and decisions.
 
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use codex_core::context::GuardianContextMode;
 use codex_extension_api::ExtensionMetrics;
 
 use super::decisions::DecisionsError;
+use super::probe_shadow::ProbeComparison;
 use super::sampler::LunaSamplerError;
 
 pub(super) const CLASSIFICATION_METRIC: &str = "codex.guardian_v2.classification";
@@ -26,7 +27,6 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
         LunaSamplerError::MissingOutput => "missing_output",
         LunaSamplerError::OutputTooLarge => "output_too_large",
         LunaSamplerError::Superseded => "superseded",
-        LunaSamplerError::IncompatibleCompaction => "incompatible_compaction",
         LunaSamplerError::InputTooLarge => "input_too_large",
         LunaSamplerError::QueueFull => "queue_full",
         LunaSamplerError::Api(error) => match error {
@@ -47,16 +47,26 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
+            ApiError::WebsocketMessageTooLarge => "websocket_message_too_large",
+            ApiError::ResponseIncomplete(_) => "incomplete_response",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
-            ApiError::QuotaExceeded => "quota_exceeded",
+            ApiError::SpendLimitExceeded(_) | ApiError::QuotaExceeded => "quota_exceeded",
             ApiError::UsageNotIncluded => "usage_not_included",
+            ApiError::SessionBudgetExceeded => "session_budget_exceeded",
             ApiError::Retryable { .. } => "retryable_api_error",
             ApiError::RateLimitExceeded { .. } | ApiError::RateLimit(_) => "rate_limit",
-            ApiError::InvalidRequest { .. } | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::ModelNotFound { .. } => "model_not_found",
+            ApiError::InvalidRequest { .. }
+            | ApiError::InvalidAudioInput { .. }
+            | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::AccessProgramNotEnabled { .. } => "access_program_not_enabled",
+            ApiError::ContentPolicyViolation { .. } => "content_policy_violation",
             ApiError::CyberPolicy { .. }
             | ApiError::BioPolicy { .. }
+            | ApiError::InferenceHookDenied { .. }
             | ApiError::MisalignmentPolicyViolation { .. } => "policy_error",
             ApiError::ServerOverloaded { .. } => "server_overloaded",
+            ApiError::PolicyCapacityUnavailable { .. } => "policy_capacity_unavailable",
             ApiError::FlexUnavailable => "flex_unavailable",
         },
     }
@@ -64,11 +74,31 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
 
 pub(super) fn record_classification(
     metrics: Option<&dyn ExtensionMetrics>,
+    probe_comparison: Option<&ProbeComparison>,
     context_mode: GuardianContextMode,
     duration: Duration,
     outcome: &str,
+    classification_risk: Option<&str>,
     failure_reason: Option<&str>,
 ) {
+    // Shadow comparisons cover every reported classification outcome, including early exits.
+    if let Some(comparison) = probe_comparison {
+        comparison.record(
+            context_mode,
+            outcome,
+            classification_risk,
+            duration,
+            failure_reason,
+        );
+    }
+    if outcome == "failure" {
+        tracing::warn!(
+            failure_reason,
+            context_mode = context_mode.as_str(),
+            duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            "Guardian V2 background scoring failed"
+        );
+    }
     let Some(metrics) = metrics else {
         return;
     };
@@ -149,11 +179,19 @@ pub(super) fn record_request_tokens(
         ("new_input", total.saturating_sub(existing)),
         ("total", total),
     ] {
+        let mut tags = vec![("target", "async"), ("component", component)];
+        // Histogram Count grouped by token_bucket counts only admitted complete inputs.
+        if component == "total" {
+            tags.push((
+                "token_bucket",
+                codex_guardian_context::request_token_bucket(total),
+            ));
+        }
         metrics.histogram_with_boundaries(
             codex_guardian_context::REQUEST_TOKENS_METRIC,
             i64::try_from(tokens).unwrap_or(i64::MAX),
             codex_guardian_context::REQUEST_TOKENS_BOUNDARIES,
-            &[("target", "async"), ("component", component)],
+            &tags,
         );
     }
 }
@@ -175,9 +213,12 @@ pub(super) fn record_decisions_comparison_outcome(
 // Keep all backend diagnostics bounded and free of raw transport data.
 pub(super) fn decisions_failure_reason(error: DecisionsError) -> &'static str {
     match error {
-        DecisionsError::Credentials => "provider_error",
+        DecisionsError::Credentials => "credentials_unavailable",
         DecisionsError::ClientSetup => "request_build_error",
-        DecisionsError::UnsupportedEvidence => "decisions_unsupported_evidence",
+        DecisionsError::UnexpectedRequestSetup => "unexpected_request_setup",
+        DecisionsError::UnsupportedInputItem => "unsupported_input_item",
+        DecisionsError::UnsupportedImage => "image",
+        DecisionsError::UnsupportedAudio => "audio",
         DecisionsError::InputTooLarge => "input_too_large",
         DecisionsError::Timeout => "transport_timeout",
         // The adapter erases transport details; do not claim a specific network failure.
@@ -205,9 +246,12 @@ pub(super) fn record_decisions_comparison(
         Ok((result, duration)) => {
             let outcome = match &result {
                 Ok(_) => "success",
-                Err(DecisionsError::UnsupportedEvidence | DecisionsError::InputTooLarge) => {
-                    "skipped"
-                }
+                Err(
+                    DecisionsError::UnsupportedInputItem
+                    | DecisionsError::UnsupportedImage
+                    | DecisionsError::UnsupportedAudio
+                    | DecisionsError::InputTooLarge,
+                ) => "skipped",
                 Err(_) => "failure",
             };
             record_decisions_comparison_outcome(
